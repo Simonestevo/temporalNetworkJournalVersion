@@ -1,0 +1,2598 @@
+---
+title: "Identify resolution at which most variability in risk metric occurs"
+author: "Simone Stevenson"
+date: "12/12/2024"
+output: html_document
+objective: temporal analysis
+---
+
+2024
+
+This is the main code for the manuscript "Seasonal alignment of maritime 
+shipping and species reproduction can affect the spread of marine invasive species"
+
+NB: this markdown wasn't prepared to be knit
+
+# AIM 1: Identify if incoming vessels from overseas display significant seasonality
+across summer, autumn, winter, spring
+
+
+# AIM 2: Identify if incoming vessels from domestic locations display significant
+seasonality across summer, autumn, winter, spring
+
+# AIM 3: Quantify how much overlap there is in incoming vessel TWSA peaks,
+and typical spawning times of different species-types (eg winter vs summer spawners)
+
+```{r clear space,include = FALSE}
+
+rm(list = ls())
+
+```
+
+```{r setup, include=FALSE}
+
+# https://bookdown.org/yihui/rmarkdown/r-code.html
+
+knitr::opts_chunk$set(echo = FALSE, message = FALSE,
+  warnings = FALSE, error = FALSE)
+
+```
+
+```{r libraries}
+
+#.libPaths('C:/R/R-4.3.1/library')
+
+if (!require(pacman)) install.packages("pacman")
+
+pacman::p_load(tidyverse, kableExtra, networkDynamic, 
+               ndtv, tsna, networkDynamicData, scales, sf,
+               ggmap,rnaturalearth, rnaturalearthdata, ggspatial,
+               ggridges, mapview, plotly, igraph, ggnewscale, gridExtra,
+               patchwork, timetk, TSA, cowplot, FSA, ggstatsplot, tools,
+               ggpubr)
+
+```
+
+```{r spatial edge function}
+
+#' Prepare spatial edges
+#'
+#' This function takes a data frame of edges, a name for the data set, and a data frame of coordinates, and returns a data frame of spatial edges, with x and y coordinates for each port, and a unique edge ID.
+#'
+#' @param edges A data frame edgelist with From port, To port, edge weight
+#' @param name A character string denoting the name you want to give your edge data
+#' @param coords A data frame containing the coords of your nodes (ports) 
+#' @param var A character string denoting the name of any extra variable you want to keep
+#' 
+#' @return A data frame with columns for the departure port (\code{from}), the destination port (\code{to}), the weight of the edge (\code{weight}), the x-coordinate of the departure port (\code{x}), the y-coordinate of the departure port (\code{y}), the x-coordinate of the destination port (\code{xend}), the y-coordinate of the destination port (\code{yend}), and a unique ID for each edge (\code{edge.id}).
+#' 
+#' @examples
+#' data("edges")
+#' data("coords")
+#' prepSpatialEdges(edges, "example", coords)
+#'
+#' @import dplyr
+#' @importFrom stats seq
+#' @importFrom stats na.omit
+#'
+#' @export
+prepSpatialEdges <- function(edges, label, coords, var = NULL) {
+  
+  edges$dataName <- label
+  
+  edges$Id <- seq(1, nrow(edges))
+  
+if(!is.null({{var}})) {
+  
+spatialEdges <- edges %>% 
+    dplyr::select(FrPort, ToPort, weight, {{var}}) %>% 
+    merge(coords[c("Name", "Lon", "Lat")], by.x = "FrPort",
+          by.y = "Name") %>% 
+    dplyr::select(-geometry) %>% 
+    rename(x = Lon,
+           y = Lat) %>% 
+    merge(coords[c("Name", "Lon", "Lat")], by.x = "ToPort",
+          by.y = "Name") %>% 
+    dplyr::select(-geometry) %>%
+    rename(xend = Lon,
+           yend = Lat) %>% 
+    rename(from = FrPort,
+           to = ToPort,
+           weight = weight) %>% 
+    # Filter out the self loops, is there a better way to rep them?
+    filter(x != xend) %>% 
+    filter(y != yend)
+
+  } else {
+    
+spatialEdges <- edges %>% 
+    dplyr::select(FrPort, ToPort, weight) %>% 
+    merge(coords[c("Name", "Lon", "Lat")], by.x = "FrPort",
+          by.y = "Name") %>% 
+    dplyr::select(-geometry) %>% 
+    rename(x = Lon,
+           y = Lat) %>% 
+    merge(coords[c("Name", "Lon", "Lat")], by.x = "ToPort",
+          by.y = "Name") %>% 
+    dplyr::select(-geometry) %>%
+    rename(xend = Lon,
+           yend = Lat) %>% 
+    rename(from = FrPort,
+           to = ToPort,
+           weight = weight) %>% 
+    # Filter out the self loops, is there a better way to rep them?
+    filter(x != xend) %>% 
+    filter(y != yend)
+  
+}
+  
+  # Check we don't have any edges with same start and finish (otherwise map won't draw)
+  check <- spatialEdges %>% mutate(xcheck = ifelse(x == xend, TRUE, FALSE),
+                                   ycheck = ifelse(y == yend, TRUE, FALSE))
+  
+  # Should be all false
+  table(check$xcheck)
+  table(check$ycheck)
+  
+  return(spatialEdges)
+}
+
+
+```
+
+```{r kruskal wallis function}
+
+# Kruskal-Wallis test
+
+getDifferences <- function(nodeList, variable, significanceLevel) {
+
+meanDiffs <- list()
+mdNames <- vector()
+
+for (i in seq_along(nodeList)) {
+  
+  df <- nodeList[[i]]
+  
+  node <- unique(df$ToPort)
+  
+  form <- as.formula(paste("weight", variable, sep = "~"))
+  #Perform the main test
+  different <- kruskal.test(form, data = df)
+
+      if(different$p.value > significanceLevel) {
+      
+      print(paste("KW test for", node, "is not significant"))
+      
+      } else {
+    
+      # See which groups are different (posthoc test)
+    
+      ph <- dunnTest(form, data = df, method="bh", kw = TRUE)
+    
+      meanDiffs[[i]] <- as.data.frame(ph$res) %>% filter(P.adj < significanceLevel) %>% mutate(name = node)
+    
+      }
+}
+
+results <- do.call(rbind, meanDiffs)
+}
+
+```
+
+```{r identify differences}
+
+# Function that takes the differences dataframes produced by the getDifferences function,
+# and makes a list of ports and whether they do or do not experience differences in
+# TWSA across that time resolution
+
+timeStatus <- function(data, columnName) {
+  
+  # Get the ports that show a difference in TWSA across the time resolution
+  diffPorts <- unique(data$name)
+  diffdf <- data.frame(name = diffPorts, x = TRUE)
+  
+  # Get the ports that we have data for, but which do not show a difference in TWSA across the time resolution
+  samePorts <- setdiff(unique(dailyNodesIncomplete$ToPort), diffPorts)
+  
+  if(is_empty(samePorts)) { # the national trend won't have same ports so we just want to grab the diff df
+  
+  result <- diffdf
+  
+  names(result) <- c("name", columnName)
+  
+  return(result)
+  
+  } else {
+  
+  samedf <- data.frame(name = samePorts, x = FALSE)
+
+  result <- rbind(diffdf, samedf)
+  
+  names(result) <- c("name", columnName)
+  
+  return(result)
+  }
+}
+
+```
+
+# User inputs
+
+```{r user inputs}
+
+manuscriptVersion <- "v13"
+
+saveOutputs <- TRUE
+
+# Labels for months
+
+Months <- c("Annual", "January", "February", "March", "April", "May",
+            "June", "July", "August", "September", "October",
+            "November", "December")
+
+jurisdictions <- c("international", "domestic", "national")
+
+# Exemplar ports we will use for figures
+
+domesticHigh <- c("Milford_NZ", "Akaroa_NZ", "Havelock_NZ")
+internationalModerate <- c("Port Chalmers_NZ", "Nelson_NZ", "Timaru_NZ")
+domesticModerate <- c("Port Fitzroy_NZ", "Auckland_NZ", "Waiheke Island_NZ")
+internationalNone <- c("Auckland_NZ", "Dunedin_NZ", "Picton_NZ")
+domesticNone <- c("Marsden Point_NZ", "Kawau_NZ", "Whanganui_NZ")
+
+allExemplarPorts <- c(domesticHigh, internationalModerate, domesticModerate, internationalNone, domesticNone)
+
+domesticHigh <- paste0("domestic", c("Milford_NZ", "Akaroa_NZ", "Havelock_NZ"))
+internationalModerate <- paste0("international", c("Port Chalmers_NZ", "Nelson_NZ", "Timaru_NZ"))
+domesticModerate <- paste0("domestic", c("Port Fitzroy_NZ", "Auckland_NZ", "Waiheke Island_NZ"))
+internationalNone <-paste0("international",  c("Auckland_NZ", "Dunedin_NZ", "Picton_NZ"))
+domesticNone <- paste0("domestic", c("Marsden Point_NZ", "Kawau_NZ", "Whanganui_NZ"))
+
+allExemplarPortsJurisdiction <- c(domesticHigh, internationalModerate, domesticModerate, internationalNone, domesticNone)
+
+```
+
+# Directories
+
+```{r set up directories, include=FALSE, message = FALSE}
+
+# File path to the parent project directory where you want to get all your inputs and store outputs
+project_directory <- 'S:/RDS28221-BiosecurityToolbox/individualProjects/temporalNetworksSimone/Data'
+
+# Get the date so we can add it to outputs
+
+today <- Sys.Date()
+
+# Create a directory to store raw inputs as received
+
+inputs <- file.path(project_directory, "1_rawInputs")
+
+# Path to store current work in progress and files created in R
+
+wipR <- file.path(project_directory, "2_codeWIP")
+
+# Path to store current work in progress and files created in GIS
+# software then used by this code
+
+wipGIS <- file.path(project_directory, "3_nonCodeWIP")
+
+# Path to directory to store all finalised data outputs
+
+cleanOutputs <- file.path(project_directory, "4_cleanOutputs")
+
+# Path to directory to store all manuscript_figures
+
+manuscriptFigures <- file.path(project_directory, "5_manuscriptFigures", manuscriptVersion)
+
+# Path to store all supporting info figures
+
+supportingFigures <- file.path(project_directory, "6_supportingFigures", manuscriptVersion)
+
+# Path to project level data
+
+projectData <- "S:/RDS28221-BiosecurityToolbox/projectData/4_cleanOutputs/"
+
+```
+
+# Load input data
+
+(currently removed while we check what can be published)
+
+```{r load data, include = FALSE}
+
+
+
+```
+
+# Check and prep data
+
+```{r check anchorages}
+
+summary(VesEdgeList)
+
+# Define the pattern
+pattern <- c("Anch", "anch")
+
+# Filter rows where either FrPort or ToPort includes the pattern
+anchoragesEdgeList <- VesEdgeList %>%
+  filter(grepl(paste(pattern, collapse = "|"), FrPort, ignore.case = TRUE) |
+         grepl(paste(pattern, collapse = "|"), ToPort, ignore.case = TRUE))
+
+# If you look at the start date, almost all of our anchorage edges don't start until
+# midway through 2016, whereas the rest of the edges start at the beginning of
+# 2016. May have been an error in the data provided by MT or our reuqest.
+
+# summary(anchoragesEdgeList)
+
+# Check if it is the same for the vessel level edge list, to make sure the first
+# 6 months didn't get lost in a processing step from vessel to edge level
+
+anchoragesVesDat <- VesDat %>%
+  filter(grepl(paste(pattern, collapse = "|"), NowPort, ignore.case = TRUE) |
+         grepl(paste(pattern, collapse = "|"), PredLastPort, ignore.case = TRUE)|
+         grepl(paste(pattern, collapse = "|"), PredNextPort, ignore.case = TRUE))
+
+# summary(anchoragesVesDat) # start times begin June 2016 here too
+
+```
+
+```{r check vessel size}
+
+# Vessel size - we have vessels where length < 30m?
+hist(VesEdgeList$Length, breaks = 100)
+abline(v = 30, col = "red") # can see a small number of vessels < 30m
+
+smallVessels <- VesEdgeList %>%
+  filter(Length < 30) %>% 
+  select(mmsi,VesTypeNew, Length, TWSA) %>% 
+  distinct()
+
+smallVesselsDat <- VesDat %>%
+  filter(Length < 30) %>% 
+  select(MMSI, IMO, VesType, Length) %>% 
+  distinct()
+
+largeVesselsDat <- VesDat %>%
+  filter(Length > 30) %>% 
+  select(MMSI, IMO, VesType, Length) %>% 
+  distinct()
+
+vesselsDat <- VesDat %>%
+  select(MMSI, IMO, VesType, Length) %>% 
+  distinct() %>% 
+  group_by(IMO) %>% 
+  mutate(n_mmsi = n_distinct(MMSI)) %>%
+  ungroup()
+
+table(smallVessels$VesTypeNew) # mostly fishing vessels
+
+```
+
+## Check destinations
+
+A few places where commercial vessels might not be expected, however kiwis
+had a look at the data and satisfied these are explainable.
+
+```{r check destinations}
+
+weirdDestinations <- c("Whitianga", "Chelsea", "Half Moon Bay", "Ravensbourne", "Russel", "Snares", "Westhaven", "Whangarei", "Russel")
+
+weirdDestVesEdgeList <- VesEdgeList[VesEdgeList$ToPort %in% weirdDestinations ,]
+
+weirdDestVesEdgeList <- weirdDestVesEdgeList %>%
+filter(code == 4)
+
+table(weirdDestVesEdgeList$ToPort)
+# Now check the VesDat
+
+ves1 <- VesDat %>% 
+        filter(MMSI == 234567890)
+
+if(saveOutputs == TRUE) {
+  
+write.csv(weirdDestVesEdgeList, file.path(cleanOutputs, manuscriptVersion,
+                                          "weirdInternationalDestinationEdgeList.csv"))
+  
+}
+
+```
+
+```{r date index}
+# Make a date index for all days of the year
+
+dateIndex <- data.frame(timeStep = c(1:366))
+
+```
+
+```{r prep spatial data}
+
+# https://1.r-bloggers.com/2018/05/three-ways-of-visualizing-a-graph-on-a-map/
+
+# Shapefile for New Zealand
+NZCoast <- ne_countries(scale = "medium", returnclass = "sf", 
+                        country = "New Zealand")
+
+NZCoast <- st_transform(NZCoast, crs = 2193)
+
+# Points for our nodes (there are points for 128 commercial nodes in NZ)
+nodesNZ <- commercialNodes %>% 
+           filter(Country == "NZ") %>% 
+           st_transform(2193) %>%
+           mutate(Lon = sf::st_coordinates(.)[,1],
+           Lat = sf::st_coordinates(.)[,2]) %>%
+           mutate(test = paste(SRC, Name)) %>% 
+           filter(test != "DoC Snares") %>% 
+           dplyr::select(-test) %>% 
+           mutate(name = Name,
+                  Name = paste(name, Country, sep = "_"))
+
+# Add another made up node for all of NZ
+
+nz <- data.frame(Country = "NZ", 
+                 Region = NA,
+                 SRC = "Simone",
+                 Notes = NA,
+                 Name = "NZ_NZ", 
+                 Type = "Commercial",
+                 Class = NA,
+                 Lat = -42.22,
+                 Lon = 173.40,
+                 geometry = NA,
+                 name = "New Zealand") %>% 
+  st_as_sf(coords = c("Lon", "Lat"), crs = 4326) 
+
+nz <- st_transform(nz, crs = 2193)
+
+nz <- nz %>% 
+      mutate(Lat = st_coordinates(.)[,2],
+             Lon = st_coordinates(.)[,1]) %>% 
+      select(names(nodesNZ))
+
+nodesNZ <- rbind(nodesNZ, nz)
+
+# Get the names of the anchorage nodes
+
+nodesAnchorages <- nodesNZ$Name[grepl(paste(pattern, collapse = "|"), nodesNZ$Name, ignore.case = TRUE)]
+        
+nodesAnchorages
+
+```
+
+
+```{r fix whanganui entries}
+
+# Two different ways of spelling wanganui, whanganui is correct way, make everything consistent.
+
+# End year is NA for code 4 so if we run the code below it deletes nearly all international
+dailyEdgesIncomplete <- dailyEdgesIncomplete %>%
+                        filter(endYear != 2020)
+
+dailyEdgesIncomplete <- dailyEdgesIncomplete %>%
+  mutate(ToPort = str_replace_all(ToPort, "Wanganui_NZ", "Whanganui_NZ"))
+
+nodesNZ <- nodesNZ %>%
+  mutate(Name = str_replace_all(Name, "Wanganui_NZ", "Whanganui_NZ"),
+         name = str_replace_all(name, "Wanganui", "Whanganui"))
+
+VesEdgeList <- VesEdgeList %>%
+  mutate(ToPort = str_replace_all(ToPort, "Wanganui", "Whanganui"))
+
+```
+
+## Split int and domestic arrivals
+
+```{r split domestic and international}
+# Grab just the incoming intnl edges
+intEdgesIncomplete <- dailyEdgesIncomplete %>%
+                          filter(code == 4) %>% 
+                      select(-startDate)
+  
+# Grab just the incoming intnl edges
+domEdgesIncomplete <- dailyEdgesIncomplete %>%
+                          filter(code == 1|code == 2) %>% 
+                      select(-startDate)
+
+```
+
+## Make national arrivals data
+
+```{r make national dataset}
+
+domNational <- domEdgesIncomplete %>%
+     group_by(endDate) %>%
+     mutate(totalTWSA = sum(totalTWSA, na.rm = TRUE),
+         meanHours = mean(meanHours, na.rm = TRUE),
+         totalMovements = sum(totalMovements, na.rm = TRUE),
+         FrPort = "NZ_NZ",
+         ToPort = "NZ_NZ",
+         edgeName = paste(FrPort, ToPort, sep = "_"),
+         code = 12) %>% 
+     ungroup(.) %>%
+     distinct(.)
+
+intNational <- intEdgesIncomplete %>%
+     group_by(endDate) %>%
+     mutate(totalTWSA = sum(totalTWSA, na.rm = TRUE),
+         meanHours = mean(meanHours, na.rm = TRUE),
+         totalMovements = sum(totalMovements, na.rm = TRUE),
+         FrPort = "OS_OS", #overseas
+         ToPort = "NZ_NZ",
+         edgeName = paste(FrPort, ToPort, sep = "_"),
+         code = 4) %>% 
+     ungroup(.) %>%
+     distinct(.)
+
+allNational <- rbind(domNational, intNational) %>% 
+     group_by(endDate) %>%
+     mutate(totalTWSA = sum(totalTWSA, na.rm = TRUE),
+         meanHours = mean(meanHours, na.rm = TRUE),
+         totalMovements = sum(totalMovements, na.rm = TRUE),
+         FrPort = "All_NZ", #overseas
+         ToPort = "NZ_NZ",
+         edgeName = paste(FrPort, ToPort, sep = "_"),
+         code = 4) %>% 
+     ungroup(.) %>%
+     distinct(.)
+
+nationalEdgesIncomplete <- rbind(domNational, intNational, allNational)
+
+```
+
+```{r combine all}
+
+# So we can loop through the 3 levels of jurisdiction
+
+dailyEdgesIncompleteListRaw <- list(intEdgesIncomplete, domEdgesIncomplete, allNational)
+
+names(dailyEdgesIncompleteListRaw) <- jurisdictions
+
+```
+
+## Add empty timesteps nodes
+
+For when TWSA == 0, we still want to keep a row for that location indicating
+nothing arrived
+
+```{r prep data to add in empty timesteps}
+
+dailyNodesIncompleteList <- list()
+dailyEdgesIncompleteList <- list()
+
+for (i in seq_along(dailyEdgesIncompleteListRaw)) {
+
+# Grab one out of our list of edges
+dailyEdgesIncomplete <- dailyEdgesIncompleteListRaw[[i]]
+
+# is it international or domestic?
+label <- names(dailyEdgesIncompleteList)[i]
+
+# Find the earliest and latest dates in our dataset
+earliestDate <- min(dailyEdgesIncomplete$endDate)
+latestDate <- max(dailyEdgesIncomplete$endDate)
+
+# Calculate the day of the dataset relative to the earliest date and store it in the dateIndex column
+dailyEdgesIncomplete$dateIndex <- as.integer(difftime(dailyEdgesIncomplete$endDate, 
+                                                 earliestDate, units = "days")) + 1
+
+dailyEdgesIncompleteList[[i]] <- dailyEdgesIncomplete
+
+# Check what we got look right
+range(dailyEdgesIncomplete$dateIndex)
+
+# Make a dataframe of all the dates in the dataset and their index number
+allDaysIndex <- dailyEdgesIncomplete %>% 
+                dplyr::select(endDate, dateIndex) %>% distinct() %>% 
+                rename(endDatex = endDate) %>% 
+                arrange(endDatex)
+
+# Whittle edge list down to just the NZ ports and necessary columns
+
+dailyNodesIncomplete <- dailyEdgesIncomplete %>%
+  #filter(grepl("_NZ$", FrPort)) %>% #TEMP CODE?? KEEP INTNL PORTS
+  dplyr::select(dateIndex, ToPort, endDate, totalTWSA) %>% 
+  group_by(ToPort, endDate) %>% 
+  # add up the TWSA incoming to each port on each day from multiple edges
+  mutate(weight = sum(totalTWSA)) %>% 
+  dplyr::select(-totalTWSA) %>% 
+  ungroup() %>% distinct() 
+
+# IMPORTANT - we, remove the anchorages because they are missing
+# the first 6 months of data we have for all other ports. Otherwise the next step will add in
+# 'zero TWSA' for all the anchorages for first half of 2016, which is incorrect 
+# and will give them an inaccurate resolution. 
+
+# nrow(dailyNodesIncomplete) # how many rows
+
+dailyNodesIncompleteList[[i]] <- dailyNodesIncomplete[!grepl("Anch", dailyNodesIncomplete$ToPort),]
+
+# nrow(dailyNodesIncomplete) # now how many do we have? fewer
+
+}
+
+names(dailyNodesIncompleteList) <- jurisdictions
+
+```
+
+
+```{r add empty in timesteps for ports}
+
+dailyNodesCompleteByPortList <- vector("list", length = length(dailyNodesIncompleteList))
+
+for (i in seq_along(dailyNodesIncompleteList)) {
+  
+dailyNodesIncomplete <- dailyNodesIncompleteList[[i]]
+# If there is no action on the day, there will be no row for that day in the edge list. We want to be
+# able to see those inactive days at each port though, so let's add them and in assign
+# their outgoing TWSA value as 0. Note, if you want to make daily networks you
+# can't do this, because it will make it look like things are connected when they're not
+
+dailyNodesIncompleteByPort <- split(dailyNodesIncomplete, dailyNodesIncomplete$ToPort)
+
+# empty list to catch child loop
+dailyNodesCompleteByPort <- list()
+  
+  for (j in seq_along(dailyNodesIncompleteByPort)) {
+  
+    # Make a list of nodes with entry for each day in the time series (0s for days w no traffic),
+    # for the edge subset (int or domestic)
+    
+  dailyNodesCompleteByPort[[j]] <- allDaysIndex %>% 
+              #Merge the incomplete time series into the date index, so we end up with a row for
+              # every timestep for this node
+              merge(dailyNodesIncompleteByPort[[j]], by = "dateIndex", all.x = TRUE) %>%
+              # Bring the non NA ToPort values to the top so we can fill them down
+              arrange(ToPort) %>% 
+              # fill the FrPort for the date rows we added
+              fill(ToPort, .direction = "down") %>% 
+              # make the weight (TWSA) 0 for the rows we added
+              mutate(weight = ifelse(is.na(weight), 0, weight)) %>% 
+              # reorder by date
+              arrange(dateIndex) %>% 
+              # merge the date columns
+              mutate(endDate = coalesce(endDatex, endDate)) %>% 
+              dplyr::select(-endDate) 
+  
+  }
+
+ #Put the list of timestep dataframes for a subset into the parent 'int' or 'dom' list
+
+ dailyNodesCompleteByPortList[[i]] <- dailyNodesCompleteByPort
+
+}
+#lapply(dailyNodesCompleteByPort, dim) # should all be the same
+
+
+```
+
+
+## Add empty timesteps edges
+
+```{r add empty timesteps for edges}
+
+# If there is no action on the day, there will be no row for that day in the edge list. We want to be
+# able to see those inactive days at each port though, so let's add them and in assign
+# their outgoing TWSA value as 0. Note, if you want to make daily networks you
+# can't do this, because it will make it look like things are connected when they're not
+
+dailyEdgesCompleteList <- list()
+
+for (i in seq_along(dailyEdgesIncompleteList)) {
+
+  # grab just intnl or just domestic edges
+dailyEdgesIncompleteNZ <- dailyEdgesIncompleteList[[i]]
+
+# split them into individual edges
+dailyEdgesIncompleteByEdge <- split(dailyEdgesIncompleteNZ, dailyEdgesIncompleteNZ$edgeName)
+
+    dailyEdgesCompleteByEdge <- list()
+    
+    for (j in seq_along(dailyEdgesIncompleteByEdge)) {
+    
+    # For each edge, either add their existing TWSA or add a 0 for the days they're not active
+    dailyEdgesCompleteByEdge[[j]] <- allDaysIndex %>% 
+                #Merge the metrics into the date index, so we end up with a row for
+                # every timestep for this edge
+                merge(dailyEdgesIncompleteByEdge[[j]], by = "dateIndex", all.x = TRUE) %>%
+                # Bring the non NA FrPort values to the top so we can fill them down
+                arrange(edgeName) %>% 
+                # fill the missing columns for the date rows we added
+                fill(edgeName, .direction = "down") %>% 
+                fill(code, .direction = "down") %>% 
+                fill(FrPort, .direction = "down") %>% 
+                fill(ToPort, .direction = "down") %>% 
+                # make the weight (TWSA) 0 for the rows we added
+                mutate(totalTWSA = ifelse(is.na(totalTWSA), 0, totalTWSA),
+                       totalMovements = ifelse(is.na(totalMovements), 0, totalMovements),
+                       meanHours = ifelse(is.na(meanHours), 0, meanHours)) %>% 
+                # reorder by date
+                arrange(dateIndex) %>% 
+                # merge the date columns
+                mutate(endDate = coalesce(endDatex, endDate)) %>% 
+                dplyr::select(-endDate) 
+    
+    }
+    
+    # Turn it back into a single dataframe for each domestic or international subset
+    dailyEdgesComplete <- do.call(rbind, dailyEdgesCompleteByEdge)
+    
+    # Store them in the intnl/dom parent list
+    dailyEdgesCompleteList[[i]] <- dailyEdgesComplete
+    
+}
+
+```
+
+## Add time resolution categorical columns
+
+```{r add categorical vars to edges}
+
+dailyEdgesCompleteList2 <- list()
+
+for (i in seq_along(dailyEdgesCompleteList)) {
+    
+    dailyEdgesCompleteList2[[i]] <- dailyEdgesCompleteList[[i]] %>% 
+                    # Add categorical variables to each day in our dataset, describing its place
+                    # in various different time windows
+                    mutate(year = factor(year(endDatex)),
+                           month = factor(month(endDatex)),
+                           season = ifelse(month %in% c(12, 1, 2), "Summer",
+                                    ifelse(month %in% 3:5, "Autumn",
+                                    ifelse(month %in% 6:8, "Winter",
+                                    ifelse(month %in% 9:11, "Spring", 
+                                    NA_character_)))),
+                           endDatex = as.Date(endDatex),  # Convert endDatex to Date if it's not already
+                           dayOfYear = as.numeric(format(endDatex, "%j", 
+                                                         tz = "Pacific/Auckland")))  # Extract day of year using %j format
+    
+}
+
+```
+
+
+```{r add categorical vars to nodes}
+
+dailyNodesCompleteTimeByPortList <- list()
+
+
+for (i in seq_along(dailyNodesCompleteByPortList)) {
+  
+    # Get out domestic/intnl subset
+    dailyNodesCompleteByPort <- dailyNodesCompleteByPortList[[i]]
+  
+    dailyNodesCompleteTimeByPort <- list()
+    
+    # For each node in this subset
+    for (j in seq_along(dailyNodesCompleteByPort)) {
+    
+    # Format the time
+    dailyNodesCompleteByPort[[j]]$endDatex <- as.Date(dailyNodesCompleteByPort[[j]]$endDatex)
+      
+    df <- dailyNodesCompleteByPort[[j]] %>% 
+        # Add categorical variables to each day in our dataset, describing its place
+        # in various different time windows
+        mutate(
+          dayOfTheWeek = factor(wday(endDatex, label = FALSE)),
+          weekOfTheYear = factor(week(endDatex)),
+          month = factor(month(endDatex)),
+          year = factor(year(endDatex)),
+          season = ifelse(month %in% c(12, 1, 2), "Summer",
+                          ifelse(month %in% 3:5, "Autumn",
+                                 ifelse(month %in% 6:8, "Winter",
+                                        ifelse(month %in% 9:11, "Spring", 
+                                               NA_character_)))),
+          winter = ifelse(season == "Winter", TRUE, FALSE),
+          weekend = ifelse(dayOfTheWeek == 7, TRUE,
+                           ifelse(dayOfTheWeek == 1, TRUE, FALSE))
+        )
+        
+    dailyNodesCompleteTimeByPort[[j]] <- df
+    
+    }
+    
+    dailyNodesCompleteTimeByPortList[[i]] <- dailyNodesCompleteTimeByPort
+    
+}
+
+```
+
+# Test for seasonal differences
+
+## Check distributions
+
+We want to check if the data is normally distributed. If it is, we can use an ANOVA test. 
+If it is not, we can use a Kruskal-Wallis test.
+
+We want to use these tests to determine whether the differences in mean TWSA
+between the different time units (eg between summer and winter) are significant.
+
+```{r test distributions}
+
+kwPortsList <- list()
+anovaPortsList <- list()
+
+for(i in seq_along(dailyNodesCompleteTimeByPortList)) {
+
+dailyNodesCompleteTimeByPort <- dailyNodesCompleteTimeByPortList[[i]]
+
+    kwPorts <- list()
+    anovaPorts <- list()
+    
+    for(j in seq_along(dailyNodesCompleteTimeByPort)) {
+      
+    df <- dailyNodesCompleteTimeByPort[[j]]
+    
+    # Check if normally distributed
+    
+    dfSum <- df %>%
+      group_by(dayOfTheWeek) %>%
+      summarise(n = n(),
+                mean = mean(weight, na.rm = TRUE),
+                sd = sd(weight, na.rm = TRUE))
+    
+      if (any(dfSum$sd == 0)) {
+      
+      kwPorts[[j]] <- df
+          
+      } else {
+      
+      # Shapiro wilks test of normality
+      swResult <- df %>%
+      group_by(dayOfTheWeek) %>%
+      summarise(`W Stat` = shapiro.test(weight)$statistic,
+                p.value = shapiro.test(weight)$p.value)
+    
+        if (any(swResult$p.value < 0.05)) {
+          
+          kwPorts[[j]] <- df
+          
+        } else {
+          
+          anovaPorts[[j]] <- df
+          
+        }
+      }
+    }
+
+length(kwPorts)
+length(anovaPorts)
+
+kwPortsList[[i]] <- kwPorts
+
+anovaPortsList[[i]] <- anovaPorts
+
+}
+# Data for all ports is non-normally distributed, there are no ports with a normal
+# distribution of TWSA (weight) in intnl or domestic edges (unsurprising, we have a lot of 
+# 0s in the data). This remains the same regardless of which time unit
+# we use. Therefore we will use a Kruskal-Wallis (non-parametric) test of difference
+# in means.
+
+# lapply(anovaPortsList, length) # usually none fit anova assumptions, should all be 0
+
+```
+
+## Kruskal-wallis test - is there a difference?
+
+Are the mean rank dialy TWSA values for the different time windows statistically different?
+Eg is the amount of TWSA outgoing during winter days different from that which is outgoing
+in summer days?
+
+- KW test identifies whether there is significant difference between groups
+- Dunn test identifies which groups are different
+
+```{r get differences}
+
+seasonalKWOutputList <- vector("list", length = length(kwPortsList))
+
+for(i in seq_along(kwPortsList)) {
+
+kwPorts <- kwPortsList[[i]]
+
+seasonalKWOutputList[[i]] <- getDifferences(kwPorts, "season", 0.05)
+
+}
+
+```
+
+## Dunn test - if yes, which seasons are different?
+
+```{r port status loop}
+
+# Identify ports that experience seasonal differences in outgoing TWSA
+
+temporalResultsList <- vector("list", length(seasonalKWOutputList))
+portsWithSeasonaIncursionRiskVariabilityList <- vector("list", length(seasonalKWOutputList))
+
+for (i in seq_along(seasonalKWOutputList)) {
+  
+temporalResultsList[[i]] <- timeStatus(seasonalKWOutputList[[i]], "season")
+
+portsWithSeasonaIncursionRiskVariabilityList[[i]] <- temporalResultsList[[i]] %>% 
+  filter(season == TRUE)
+
+}
+
+if(length(temporalResultsList) != 3) {
+  stop("Error: length of temporalResultsList is not 3")
+}
+
+if(nrow(temporalResultsList[[3]]) != 1) {
+  stop("Error: number of rows in national temporal results is not 1")
+}
+```
+
+# Calculate seasonal stats for locations
+
+## Means
+
+```{r bin means}
+
+nodeBinnedMeansList <- list()
+
+for(i in seq_along(dailyNodesCompleteTimeByPortList)) {
+
+dailyNodesCompleteTimeByPort <- dailyNodesCompleteTimeByPortList[[i]]
+
+# For nodes
+dailyNodesCompleteTime <- do.call(rbind, dailyNodesCompleteTimeByPort)
+# Summarise the weights by time window
+
+# Calculate the mean for each group and add as new columns
+nodeBinnedMeansList[[i]] <- dailyNodesCompleteTime %>%
+      group_by(ToPort, month) %>%
+      mutate(meanTWSAMonth = mean(weight, na.rm = TRUE)) %>%
+      ungroup() %>%
+      group_by(ToPort, season) %>%
+      # Calculate the aggregate mean total TWSA for each season
+      mutate(meanTWSASeason = mean(weight, na.rm = TRUE),
+             sdTWSASeason = sd(weight, na.rm = TRUE),
+             jurisdiction = jurisdictions[i]) %>%
+      ungroup() %>%
+      group_by(ToPort) %>%
+      # Calculate the coefficient of variation in seasonal means
+      mutate(seasonalCV = sd(meanTWSASeason, na.rm = TRUE) / mean(meanTWSASeason, na.rm = TRUE) * 100) %>%
+      ungroup(.) %>% 
+      distinct(.)
+
+}
+
+```
+
+
+```{r make means table}
+
+nodeBinnedMeansTable <- do.call(rbind, nodeBinnedMeansList)
+
+nodeBinnedMeansTable <- nodeBinnedMeansTable %>% 
+  mutate(portJurisdiction = paste(ToPort, jurisdiction))      
+
+```
+
+## Peaks and troughs
+
+```{r seasonal max mins}
+
+seasonalPeaksTroughsList <- list()
+
+for (i in seq_along(nodeBinnedMeansList)) {
+
+  nodeBinnedMeans <- nodeBinnedMeansList[[i]]
+  
+  # our last list did not show any results so we only have 4 temp results list elements
+  # this is a hacky quick fix, should go back and make it produce something more uniform
+  
+  temporalResults <- temporalResultsList[[i]]
+  
+  nodeMax <- nodeBinnedMeans %>% 
+    select(ToPort, season, meanTWSASeason) %>%
+    distinct(.) %>% 
+    group_by(ToPort) %>%
+    filter(meanTWSASeason == max(meanTWSASeason, na.rm = TRUE)) %>%
+    rename(maxTWSA = meanTWSASeason) %>%
+    rename(seasonMax = season) %>%
+    ungroup() %>% 
+    merge(temporalResults[c("name", "season")], by.x = "ToPort", by.y = "name") %>% 
+    filter(season == TRUE) 
+  
+  # Assuming 'nodeMax' is your dataframe
+  # Group by 'FrPort' and mutate a new column 'seasonalTrough'
+  nodeMax <- nodeMax %>%
+    group_by(ToPort) %>%
+    mutate(seasonalPeak = paste(seasonMax, collapse = ", ")) %>% 
+    select(ToPort, seasonalPeak, maxTWSA) %>%
+    ungroup() %>%
+    distinct(.)
+  
+  
+  nodeMin <- nodeBinnedMeans %>% 
+    select(ToPort, season, meanTWSASeason) %>%
+    distinct(.) %>% 
+    group_by(ToPort) %>%
+    filter(meanTWSASeason == min(meanTWSASeason, na.rm = TRUE)) %>%
+    rename(minTWSA = meanTWSASeason) %>%
+    rename(seasonMin = season) %>%
+    ungroup() %>% 
+    merge(temporalResults[c("name", "season")], by.x = "ToPort", by.y = "name") %>% 
+    filter(season == TRUE) 
+  
+  # Assuming 'nodeMin' is your dataframe
+  # Group by 'FrPort' and mutate a new column 'seasonalTrough'
+  nodeMin <- nodeMin %>%
+    group_by(ToPort) %>%
+    mutate(seasonalTrough = paste(seasonMin, collapse = ", ")) %>% 
+    select(ToPort, seasonalTrough, minTWSA) %>%
+    ungroup() %>%
+    distinct(.)
+  
+  # Print the dataframe
+  # print(nodeMin)
+  
+  seasonalPeaksTroughsList[[i]] <- merge(nodeMax, nodeMin, by = "ToPort")
+  
+  rm(temporalResults)
+
+}
+
+if(length(seasonalPeaksTroughsList) != 3) {
+  
+  stop("seasonalPeaksTroughsList is not the correct length")
+  
+}
+```
+
+## Coefficient of variation
+
+```{r get node CV}
+
+nodeSeasonalCVList <- list()
+
+for(i in seq_along(nodeBinnedMeansList)) {
+  
+  nodeBinnedMeans <- nodeBinnedMeansList[[i]]
+  
+  nodeSeasonalCV <- nodeBinnedMeans %>% 
+    dplyr::select(ToPort, seasonalCV) %>%
+    distinct(.)
+  
+  nodeSeasonalCVList[[i]] <- nodeSeasonalCV
+  
+}
+
+```
+
+# Calculate seasonal stats for edges
+
+## Means
+
+```{r summarise seasonal edges}
+
+seasonalEdgeListList <- list()
+
+for(i in seq_along(dailyEdgesCompleteList2)) {
+# for edges
+
+seasonalEdgeListList[[i]] <- dailyEdgesCompleteList2[[i]] %>% 
+                    group_by(edgeName, season) %>%
+                    mutate(weight = mean(totalTWSA, na.rm = TRUE)) %>% 
+                    ungroup() %>%
+                    dplyr::select(edgeName, FrPort, ToPort, season, weight) %>%
+                    distinct(.)
+
+}
+
+```
+
+# Add spatial info to results
+
+```{r spatial data}
+
+# Prep the data for mapping outgoing patterns
+
+temporalResultsSpatialList <- list()
+
+for (i in seq_along(temporalResultsList)) {
+  
+# Categorical information (true/false for differences)
+# This step also removes the non-NZ ports
+
+temporalResultsSpatial <- temporalResultsList[[i]] %>%
+                          rename(Name = name) %>%
+                          merge(nodeSeasonalCVList[[i]], by.x = "Name",
+                                by.y = "ToPort", all.y = TRUE) %>%
+                          # All the NA values are ports for which we ahve data but 
+                          # seasonality was not detected. This is a new addition,
+                          # they didn't use to drop out so keep an eye on if something
+                          # looks off
+                          mutate(season = ifelse(is.na(season), FALSE, TRUE)) %>%
+                          merge(nodesNZ, by.y = "Name", all.y = TRUE) %>% 
+                          dplyr::select(-name) %>% 
+                          merge(seasonalPeaksTroughsList[[i]], by.x= "Name", 
+                                by.y = "ToPort", all.x = TRUE) %>%
+                          filter(!is.na(season)) %>%
+                          mutate(jurisdiction = jurisdictions[i]) %>%
+                          st_as_sf() 
+
+# Make it an ordered factor so we can draw true on top
+
+temporalResultsSpatial$season <- ordered(temporalResultsSpatial$season, 
+                                           levels = c(FALSE, TRUE), 
+                                           labels = c("FALSE", "TRUE"))
+
+
+temporalResultsSpatialList[[i]] <- temporalResultsSpatial
+
+rm(temporalResultsSpatial)
+
+}
+
+if(length(temporalResultsSpatialList) != 3) {
+  
+  stop("temporalResultsSpatialList is not the correct length")
+  
+}
+
+temporalResultsSpatialDF <- do.call(rbind, temporalResultsSpatialList)
+
+```
+
+# Fig 1: Dunn test results
+
+Positive Z Statistic: Indicates that the mean rank of the first group is higher than the mean rank of the second group.
+Negative Z Statistic: Indicates that the mean rank of the first group is lower than the mean rank of the second group.
+Magnitude of Z Statistic: The larger the absolute value of the Z statistic, the stronger the evidence against the null hypothesis of no difference between the groups.
+
+So, a red and a blue in the same column indicate that these places experience opposite
+differences.
+
+## Prep heatmap data
+
+```{r dunn results}
+
+out <- list()
+
+for(i in seq_along(seasonalKWOutputList)) {
+  
+  out[[i]] <- seasonalKWOutputList[[i]] %>% 
+              mutate(jurisdiction = jurisdictions[[i]])
+
+}
+
+dunnResultsDetails <- do.call(rbind, out)
+
+# re-order
+
+dunnResultsDetails <- dunnResultsDetails %>% 
+                      dplyr::select(name, jurisdiction, Comparison, Z, P.adj, P.unadj) %>%
+                      distinct(.) %>% 
+                      merge(nodesNZ[c("Name", "Lat", "Lon")], by.x = "name", by.y = "Name") %>%
+                      group_by(jurisdiction) %>% 
+                      arrange(desc(Lat)) %>% 
+                      ungroup()
+
+dunnResultsSimple <- dunnResultsDetails %>% 
+                     dplyr::select(name, jurisdiction, Comparison, Z) %>%
+                     mutate(Z = round(Z, 3)) %>% 
+                     distinct(.)%>%
+                     pivot_wider(names_from = Comparison, values_from = Z)
+
+heatmapData <- dunnResultsSimple %>% 
+  pivot_longer(cols = c("Autumn - Spring",
+                        "Autumn - Summer",
+                        "Spring - Winter",
+                        "Summer - Winter",
+                        "Spring - Summer",
+                        "Autumn - Winter"), names_to = "Comparison", values_to = "Z") %>% 
+                      merge(nodesNZ[c("Name", "Lat", "Lon")], by.x = "name", by.y = "Name") %>%
+                      group_by(jurisdiction) %>% 
+                      arrange(Lat) %>% 
+                      ungroup(.) %>% 
+                      mutate(name = str_replace(name, "_NZ", ""),
+                             jurisdictionAbbr = ifelse(jurisdiction == "national",
+                                                       "N",
+                                                       ifelse(jurisdiction == "domestic",
+                                                              "Domestic",
+                                                              ifelse(jurisdiction == "international", "Intl", NA))))
+
+#heatmapData$name <- factor(heatmapData$name, levels = unique(heatmapData$name))
+
+# Reorder the jurisdictionAbbr factor in reverse order
+heatmapData$jurisdictionAbbr <- fct_reorder(heatmapData$jurisdictionAbbr, desc(heatmapData$jurisdictionAbbr))
+
+# Calculate min and max values for Z
+z_min <- min(heatmapData$Z, na.rm = TRUE)
+z_max <- max(heatmapData$Z, na.rm = TRUE)
+
+# Create breaks
+breaks <- seq(z_min, z_max, length.out = 3)  # Adjust length.out for the desired number of breaks
+
+# Create labels if needed (can be adjusted as necessary)
+labels <- round(breaks, 0)  # Round to two decimal places
+
+```
+
+## Create figure
+
+```{r heatmap 2}
+
+heatmapPlot <- ggplot(heatmapData, aes(x = Comparison, y = name, fill = Z)) +
+  geom_tile(color = "white", size = 0.05) +
+  scale_fill_gradient2(
+    low = "#4575B4",       # Dark blue for negative values
+    mid = "white",         # Midpoint set to white
+    high = "#D73027",      # Dark red for positive values
+    midpoint = 0,          # Midpoint set to 0
+    na.value = "white",   # Color for NA values
+    name = "Z-statistic",
+    breaks = breaks,       # Set the breaks for the legend
+    labels = labels         # Set the labels for the legend
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+    axis.text.y = element_text(size = 12),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    strip.text.y = element_text(angle = 90, size = 12),
+    panel.spacing = unit(0.75, "lines")
+  ) +
+  labs(x = "Daily TWSA Comparison", y = "Arrival location") +
+  facet_grid(jurisdictionAbbr ~ ., scales = "free_y", space = "free_y", switch = "both")
+# Print the plot
+print(heatmapPlot)
+
+if(saveOutputs == TRUE) {
+  
+  ggsave(heatmapPlot, 
+         file = file.path(manuscriptFigures, paste0(Sys.Date(), "-fig1_", 
+                                                    manuscriptVersion, ".png")),
+         width = 7.27, height = 10.7)
+}
+
+
+```
+
+# Results tables
+
+## Categorise arrival locations (strong, medium, none)
+
+```{r make tables}
+
+options(scipen=999)
+
+# Ensure the initial selection is correct
+selectedDf <- nodeBinnedMeansTable %>%
+  select(ToPort, season, meanTWSASeason, seasonalCV, jurisdiction)
+
+# Check the selection result
+print(head(selectedDf))
+
+# Remove duplicates
+distinctDf <- distinct(selectedDf)
+
+# Check the distinct result
+print(head(distinctDf))
+
+# Pivot the dataframe wider
+seasonalMeansWide <- distinctDf %>%
+  pivot_wider(names_from = season, values_from = meanTWSASeason)
+
+# Check the pivot result
+print(head(seasonalMeansWide))
+
+# Ensure temporalResultsSpatial has the required columns
+if(!all(c("Name", "jurisdiction") %in% colnames(temporalResultsSpatialDF))) {
+  stop("temporalResultsSpatial must contain 'Name' and 'jurisdiction' columns")
+}
+
+# Merge the dataframes
+mergedDf <- merge(seasonalMeansWide,
+                  temporalResultsSpatialDF[c("Name", "jurisdiction", "season")],
+                  by.x = c("ToPort", "jurisdiction"), 
+                  by.y = c("Name", "jurisdiction"))
+
+if(mergedDf %>% nrow() == 1) {
+  stop("Error merging seasonal means to temporal results")
+}
+
+# Check the merge result
+# print(head(mergedDf))
+
+# Convert jurisdiction column to an ordered factor
+mergedDf$jurisdiction <- factor(mergedDf$jurisdiction, 
+                                levels = c("international", "domestic", "national"), 
+                                ordered = TRUE)
+
+deciles <- quantile(mergedDf$seasonalCV, prob = seq(0, 1, length = 11), type = 5)
+
+# Pick a threshold that best sorts intermittent from continuous ports
+
+maxThresholdCV <- deciles[6] #top 50%
+maxThresholdCV <- round(maxThresholdCV)
+
+
+# Sort the dataframe by the jurisdiction column
+mergedDf <- mergedDf %>%
+  arrange(jurisdiction, season) %>% st_drop_geometry() %>% 
+  mutate(subCategory = ifelse(season == TRUE & seasonalCV <= maxThresholdCV, 
+                              "moderate seasonal pattern",
+                              ifelse(season == TRUE & seasonalCV > maxThresholdCV, 
+                               "high seasonal pattern",
+                              ifelse(season == FALSE,
+                               "no seasonal pattern", NA)))) %>%
+               mutate(category = paste(jurisdiction, subCategory, sep = " - ")) %>% 
+        merge(dunnResultsSimple, by.x = c("ToPort", "jurisdiction"), 
+              by.y = c("name", "jurisdiction"), all.x = TRUE) %>% 
+  select(ToPort, jurisdiction,season, category, seasonalCV, everything()) %>% 
+  select(everything(), geometry, subCategory)
+
+```
+
+
+```{r make sd tables}
+
+options(scipen=999)
+
+selectedDf <- nodeBinnedMeansTable %>%
+  select(ToPort, season, sdTWSASeason, jurisdiction)
+
+# Check the selection result
+# print(head(selectedDf))
+
+# Remove duplicates
+distinctDf <- distinct(selectedDf)
+
+# Check the distinct result
+# print(head(distinctDf))
+
+# Pivot the dataframe wider
+seasonalSDWide <- distinctDf %>%
+  pivot_wider(names_from = season, values_from = sdTWSASeason)
+
+sdNames <- paste0("sd", c("Summer", "Autumn", "Winter", "Spring"))
+
+names(seasonalSDWide) <- c("ToPort", "jurisdiction", sdNames)
+
+# names(seasonalSDWide)
+
+# Add the sd to the table
+
+mergedDf2 <- mergedDf %>% 
+     merge(seasonalSDWide, by.x = c("ToPort", "jurisdiction"), 
+           by.y = c("ToPort", "jurisdiction")) %>% 
+     select(ToPort, jurisdiction, season, subCategory, seasonalCV,
+            Summer, sdSummer, Autumn, sdAutumn, Winter, sdWinter, 
+            Spring, sdSpring, `Autumn - Spring`,
+            `Autumn - Winter`, `Spring - Summer`, `Spring - Winter`,
+            `Autumn - Summer`, `Summer - Winter`, category, geometry)
+
+
+# names(mergedDf2)
+```
+
+## Port vessel types (supporting info)
+
+Note, in the code below I end up selecting just the 'edge' variable. Because our
+objective is to characterise how the port is mostly used, I think it makes more
+sense to assign their predominant vessel type based on the vessel type to which the
+most number of edges can be attributed. The alternative was to assign it based
+on the TWSA, but this runs the small risk that a single large vessel could skew
+the port's primary use (Eg if a port regularly receives small fishing vessels
+but then one huge container ship visits once, but its TWSA dwarfs the regular
+fishing TWSA so the port is assigned as a container ship port when it's really
+a small fishing landing).
+
+```{r port ves types}
+
+portVesselData <- VesEdgeList %>% 
+     filter(ToCntry == "NZ") %>%
+     group_by(ToPort, VesTypeNew) %>% 
+     mutate(vesselTWSA = sum(TWSA),
+            nEdges = n()) %>% 
+     ungroup(VesTypeNew) %>% 
+     mutate(totalTWSA = sum(TWSA),
+            totalEdges = n()) %>% 
+     ungroup(.) %>% 
+     mutate(percentTWSA = vesselTWSA/totalTWSA,
+         percentEdges = nEdges/totalEdges) %>% 
+     #Just grab the edge info for now
+     select(ToPort, VesTypeNew, nEdges, percentEdges) %>% 
+     distinct(.)
+
+# Remove rows where ToPort ends with "Anch" or "anch"
+portVesselDataFiltered <- portVesselData %>%
+  filter(!str_detect(ToPort, "\\b[Aa]nch\\b$"))
+
+# Group by ToPort and summarize to get the top 3 rows with highest percentEdges
+portVesselTypesTop3 <- portVesselDataFiltered %>%
+  group_by(ToPort) %>%
+  slice_max(order_by = percentEdges, n = 3, with_ties = TRUE) %>%
+  distinct() %>% # Remove any duplicates that might occur
+  arrange(ToPort) %>%
+  select(ToPort, VesTypeNew, nEdges, percentEdges)
+
+portVesselTypesSimple <- portVesselTypesTop3 %>% 
+  group_by(ToPort) %>%
+  slice(1) %>% 
+  ungroup() %>% 
+  rename(name = ToPort,
+         mainVesType = VesTypeNew) %>% 
+  mutate(ToPort = paste0(name, "_NZ"))
+
+# Save the details
+
+if(saveOutputs == TRUE) {
+  
+  write.csv(portVesselTypesTop3,
+            file.path(cleanOutputs, manuscriptVersion,
+                      paste0(Sys.Date(),"portTop3VesselTypes.csv")),
+            row.names = FALSE)
+  
+}
+
+```
+
+## Master results table
+
+```{r make master table}
+
+masterResultsTable <- mergedDf2 %>% 
+                      merge(portVesselTypesSimple[c("ToPort", "mainVesType")], 
+                             by = "ToPort",
+                             all.x = TRUE)  %>% 
+                      select(ToPort, jurisdiction, season, subCategory, mainVesType, everything()) %>% 
+                      mutate(tmp = paste0(jurisdiction, ToPort)) %>% 
+                      mutate(exemplar = ifelse(tmp %in% allExemplarPortsJurisdiction, "TRUE", "FALSE")) %>% 
+                      merge(nodesNZ[c("Name", "Lat", "Lon")], by.x = "ToPort",
+                           by.y = "Name") %>% 
+                      rename(geometry = geometry.x) %>% 
+                      select(-geometry.y, -tmp)
+
+# table(masterResultsTable$exemplar)
+
+```
+
+```{r node result categories}
+
+nodeCategories <- masterResultsTable %>% 
+                  select(ToPort, jurisdiction, season, category) %>% 
+                  distinct() %>% 
+                  rename(seasonalDifference = season)
+
+```
+
+```{r split lists}
+# Save by jurisdiction
+
+jurisdictionList <- split(masterResultsTable, masterResultsTable$jurisdiction)
+
+categoryList <- split(masterResultsTable, masterResultsTable$category)
+
+# In case we need to access individual categories
+domHigh <- categoryList[[1]]
+intnlMod <- categoryList[[4]]
+domMod <- categoryList[[2]]
+intnlNone <- categoryList[[5]]
+domNone <- categoryList[[3]]
+```
+
+```{r save results tables}
+
+if(saveOutputs == TRUE) {
+  
+for(i in seq_along(jurisdictionList)) {
+  
+  jur <- unique(jurisdictionList[[i]]$jurisdiction)
+  write.csv(jurisdictionList[[i]], 
+            file.path(cleanOutputs, manuscriptVersion,
+                      paste0(Sys.Date(),"-",jur, "-SeasonalMeans.csv")))
+  
+}
+
+# Save by category
+
+
+for(i in seq_along(categoryList)){
+  
+  
+  cat <- unique(categoryList[[i]]$category)
+  
+  print(cat)
+  
+  write.csv(categoryList[[i]],  
+            file.path(cleanOutputs, manuscriptVersion,
+                      paste0(Sys.Date(),"-",cat, "-SeasonalMeans.csv")))
+  
+}
+
+# Save full table
+write.csv(masterResultsTable, 
+          file.path(cleanOutputs,  manuscriptVersion,
+                    paste0(Sys.Date(),"-masterResultsTableSeasonalMeans.csv")))
+
+}
+
+```
+
+## Master edge list
+
+```{r dailyTWSA}
+
+parentOut <- vector("list", length = length(dailyNodesCompleteTimeByPortList))
+
+for (i in seq_along(dailyNodesCompleteTimeByPortList)) {
+  
+  jurisdictionList <- dailyNodesCompleteTimeByPortList[[i]]
+  
+  jur <- jurisdictions[[i]]
+  
+  subOut <- vector("list", length(jurisdictionList))
+  
+  for (j in seq_along(jurisdictionList)) {
+    
+    subOut[[j]] <- jurisdictionList[[j]] %>% 
+          mutate(jurisdiction = jur) %>% 
+          select(dateIndex, endDatex, ToPort, weight, year, season, jurisdiction)
+    
+  }
+  
+  parentOut[[i]] <- bind_rows(subOut)
+  
+}
+
+tmpOut <- do.call(rbind, parentOut)
+
+masterDailyEdgeList <- tmpOut %>% 
+                      merge(nodeCategories, by = c("ToPort", "jurisdiction")) %>%
+                      mutate(tmp = paste0(jurisdiction, ToPort)) %>%
+                      mutate(exemplar = ifelse(tmp %in% allExemplarPortsJurisdiction, "TRUE", "FALSE")) %>% 
+                      select(-tmp)
+
+# table(masterDailyEdgeList$exemplar)
+      
+rm(parentOut, tmpOut)
+
+if(saveOutputs == TRUE) {
+  
+  write.csv(masterDailyEdgeList,
+            file.path(cleanOutputs,  manuscriptVersion,
+                      paste0(Sys.Date(),"-masterDailyEdgeList.csv")),
+            row.names = FALSE)
+  
+}
+
+
+```
+
+## Summary table
+
+Number of locations, vessels etc in each category for writing results
+
+```{r summary}
+
+nVessels <- data.frame(
+            variable = "Number of vessels in dataset",
+            value = length(unique(VesDat$SHIP_ID))
+)
+
+nVesselCategories <- data.frame(
+            variable = "Number of vessel categories in dataset",
+            value = length(unique(VesEdgeList$VesTypeNew))
+)
+
+nUniqueLocations <- data.frame(
+            variable = "Number of unique arrival locations in dataset",
+            #subtract 1 for row that represents national results
+            value = length(unique(masterResultsTable$ToPort)) - 1)
+
+
+nJurisdictionPorts <- masterResultsTable %>%
+                      filter(jurisdiction != "national") %>% 
+                      group_by(jurisdiction) %>% 
+                      summarize(nInternational = n(), .groups = 'drop') %>% 
+                      rename(variable = jurisdiction,
+                              value = nInternational) %>% 
+                      mutate(variable = ifelse(variable == "international", 
+                                                "Number arrival locations receiving TWSA from international sources", 
+                                                "Number arrival locations receiving TWSA from domestic sources"))
+
+cvThreshold <- data.frame(
+            variable = "median CV",
+            value = maxThresholdCV)
+
+
+nParentCategories <- masterResultsTable %>%
+               filter(jurisdiction != "national") %>% 
+               group_by(subCategory) %>% 
+               summarize(nSubCategory = n(), .groups = 'drop') %>% 
+               rename(variable = subCategory,
+                      value = nSubCategory) %>% 
+               mutate(variable = paste0("Number arrival locations with ", variable))
+
+nCategories <- masterResultsTable %>%
+               filter(jurisdiction != "national") %>% 
+               group_by(category) %>% 
+               summarize(nCategory = n(), .groups = 'drop') %>% 
+               rename(variable = category,
+                      value = nCategory) %>% 
+               mutate(variable = paste0("Number arrival locations with ", variable))
+
+
+nVesTypes <- masterResultsTable %>%
+             select(ToPort, mainVesType ) %>% 
+             distinct() %>% 
+               group_by(mainVesType) %>% 
+               summarize(nVesType = n(), .groups = 'drop') %>% 
+               rename(variable = mainVesType,
+                      value = nVesType) %>% 
+               mutate(variable = paste0("Number arrival locations with mainly ", variable,
+                                        " incoming vessels"))
+
+
+percentTWSA <- masterDailyEdgeList %>%
+               select(jurisdiction, weight) %>% 
+               filter(jurisdiction != "national") %>% 
+               mutate(totalTWSA = sum(weight)) %>% 
+               group_by(jurisdiction) %>% 
+               mutate(jurisdictionTWSA = sum(weight), .groups = 'drop') %>% 
+               mutate(percentTWSA = round(jurisdictionTWSA/totalTWSA, 2)) %>% 
+               select(jurisdiction, percentTWSA) %>%
+               distinct() %>% 
+               rename(variable = jurisdiction,
+                      value = percentTWSA) %>% 
+               mutate(variable = ifelse(variable == "international", 
+                                        "% TWSA arriving from international sources", 
+                                        "% TWSA arriving from domestic sources"))
+
+totalArrivals <- VesEdgeList %>% filter(code != 0) %>% nrow()
+
+arrivals <- data.frame(
+            variable = "Total arrivals all vessels",
+            value = totalArrivals
+)
+
+vesselArrivals <- VesEdgeList %>% 
+                  filter(code != 0) %>% 
+                  group_by(VesTypeNew) %>% 
+                  summarize(nArrivals = n(), .groups = 'drop') %>% 
+                  rename(variable = VesTypeNew,
+                         value = nArrivals) %>% 
+                  mutate(variable = paste0("Number of arrivals by ", variable))
+
+summaryTable <- rbind(nVessels, nVesselCategories, nUniqueLocations, cvThreshold,
+                      nJurisdictionPorts, nParentCategories, nCategories, 
+                      nVesTypes, percentTWSA, arrivals, vesselArrivals)
+
+if(saveOutputs == TRUE) {
+  
+  write.csv(summaryTable,
+            file.path(cleanOutputs,  manuscriptVersion,
+                      paste0(Sys.Date(),"-summaryTable.csv")),
+            row.names = FALSE)
+}
+
+```
+
+# Fig 2 - 4: daily TWSA by season boxplots
+
+We plot a few exemplars for manuscript, all locations go in supporting info
+
+## Prep boxplot data
+
+```{r master results long}
+
+masterResultsTableLong <- masterResultsTable %>%
+  select(ToPort, category, jurisdiction, Summer, sdSummer, Autumn, sdAutumn,
+         Winter, sdWinter, Spring, sdSpring, exemplar) %>%
+  pivot_longer(
+    cols = c(Summer, Autumn, Winter, Spring),
+    names_to = "season",
+    values_to = "meanDailyTWSA"
+  ) %>%
+  mutate(
+    sdTWSA = case_when(
+      season == "Summer" ~ sdSummer,
+      season == "Autumn" ~ sdAutumn,
+      season == "Winter" ~ sdWinter,
+      season == "Spring" ~ sdSpring
+    )
+  ) %>%
+  select(-sdSummer, -sdAutumn, -sdWinter, -sdSpring) %>%
+  arrange(ToPort, category, jurisdiction, season) %>% 
+  mutate(source = sub(" - .*", "", category)) %>% 
+  rename(sdDailyTWSA = sdTWSA)
+
+```
+
+```{r jurisdiction pal}
+
+jurPal <- c("domestic" = "#e1c1f5", 
+         #"international" = "#488773", 
+         "international" = "#5fb398",
+         "national" = "#f1f294")
+
+```
+
+## Fig 4: Strong seasonality 
+
+Out of order bc this was originally fig 2 but I don't want to break the code
+
+```{r high exemplars facets}
+
+myComparisons <- list(c("Summer", "Winter"), 
+                      c("Summer", "Spring"),
+                      c("Summer", "Autumn"), 
+                      c("Winter", "Spring"),
+                      c("Winter", "Autumn"), 
+                      c("Autumn", "Spring"))
+
+highOrder <- c("Havelock", "Akaroa", "Milford")
+seasonOrder <- c("Summer", "Autumn", "Winter", "Spring")
+
+yy <- masterDailyEdgeList %>% 
+      mutate(subcategory = sub(".* - ", "", category)) %>% 
+      filter(subcategory == "high seasonal pattern")  %>% 
+      mutate(name = str_replace(ToPort, "_NZ", "")) %>% 
+      filter(exemplar == TRUE)
+      
+
+  # Convert 'name' to a factor with levels specified by 'highOrder'
+yy$name <- factor(yy$name, levels = highOrder)
+
+# Arrange the data frame by the 'name' column
+yy <- yy %>% arrange(name)
+
+  # Convert 'name' to a factor with levels specified by 'seasonOrder'
+yy$season <- factor(yy$season, levels = seasonOrder)
+
+# Arrange the data frame by the 'name' column
+df <- yy %>% arrange(name, season) 
+
+bxp <- ggboxplot(df, x = "season", y = "weight",
+                 fill = "jurisdiction",
+                 color = "grey30",
+               outlier.shape = 16, outlier.colour = "grey30", outlier.alpha = 0.6,
+               outlier.size = 0.5) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10)))+ 
+  geom_pwc(method = "dunn_test", label = "p.signif", hide.ns = "p.adj") +
+  facet_wrap(~name, scales = "free_y", nrow = 3) +
+   scale_fill_manual(values = jurPal) +
+      theme_classic() +
+      theme(legend.position = "bottom",
+            axis.title = element_text(size = 14),  # Adjust axis title size
+            axis.text = element_text(size = 14),
+            axis.text.x = element_text(angle = 45, hjust = 1),# Adjust axis text size
+            plot.title = element_text(size = 14),
+            strip.text = element_text(size = 16),
+            legend.text = element_text(size = 14),
+            strip.background = element_blank(),  # Remove the background of strip labels
+    strip.placement = "outside") +
+    facet_wrap(~ name, scales = "free_y", nrow = 3) +
+    labs(
+        x = "Arrival location",
+        y = expression("Daily TWSA values (m"^2*")"),
+        group = season,
+        fill = "Source jurisdiction")
+
+    if(saveOutputs == TRUE) {
+      ggsave(file.path(manuscriptFigures, 
+                       paste0(Sys.Date(), "-", "figure4Boxplots.png")), 
+             plot = bxp, width = 5, height = 10, units = "in",
+             dpi = 600)
+    }
+
+
+```
+
+## Fig 2: Moderate seasonality
+
+```{r mod exemplars facets}
+
+modOrder <- c("Port Fitzroy","Nelson" , "Waiheke Island", "Timaru","Auckland","Port Chalmers")
+
+yy <- masterDailyEdgeList %>% 
+      mutate(subcategory = sub(".* - ", "", category)) %>% 
+      filter(subcategory == "moderate seasonal pattern")  %>% 
+      mutate(name = str_replace(ToPort, "_NZ", "")) %>% 
+      filter(exemplar == TRUE)
+      
+
+# Convert 'name' to a factor with levels specified by 'modOrder'
+yy$name <- factor(yy$name, levels = modOrder)
+
+# Arrange the data frame by the 'name' column
+yy <- yy %>% arrange(name)
+
+  # Convert 'name' to a factor with levels specified by 'modOrder'
+yy$season <- factor(yy$season, levels = seasonOrder)
+
+# Arrange the data frame by the 'name' column
+modBoxplotInputData <- yy %>% arrange(name, season)
+    
+bxp <- ggboxplot(modBoxplotInputData, x = "season", y = "weight",
+                 fill = "jurisdiction",
+                 color = "grey30",
+               outlier.shape = 16, outlier.colour = "grey30", outlier.alpha = 0.6,
+               outlier.size = 0.5) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10)))+ 
+  geom_pwc(method = "dunn_test", label = "p.signif", hide.ns = "p.adj") +
+  facet_wrap(~name, scales = "free_y", nrow = 3) +
+   scale_fill_manual(values = jurPal) +
+      theme_classic() +
+      theme(legend.position = "bottom",
+            axis.title = element_text(size = 14),  # Adjust axis title size
+            axis.text = element_text(size = 14),
+            axis.text.x = element_text(angle = 45, hjust = 1),# Adjust axis text size
+            plot.title = element_text(size = 14),
+            strip.text = element_text(size = 16),
+            legend.text = element_text(size = 14),
+            strip.background = element_blank(),  # Remove the background of strip labels
+    strip.placement = "outside") +
+    facet_wrap(~ name, scales = "free_y", nrow = 3) +
+    labs(
+        x = "Arrival location",
+        y = expression("Daily TWSA values (m"^2*")"),
+        group = season,
+        fill = "Source jurisdiction") 
+
+    if(saveOutputs == TRUE) {
+      ggsave(file.path(manuscriptFigures, 
+                       paste0(Sys.Date(), "-", "figure3Boxplots.png")), 
+             plot = bxp, width = 10, height = 10, units = "in",
+             dpi = 600)
+    }
+
+
+```
+
+## Fig 3: No seasonality 
+
+```{r no pattern exemplars}
+
+noOrder <- c("Marsden Point", "Auckland", "Kawau", "Picton","Whanganui", "Dunedin")
+
+yy <- masterDailyEdgeList %>% 
+      mutate(subcategory = sub(".* - ", "", category)) %>% 
+      filter(subcategory == "no seasonal pattern")  %>% 
+      mutate(name = str_replace(ToPort, "_NZ", "")) %>% 
+      filter(exemplar == TRUE)
+      
+
+# Convert 'name' to a factor with levels specified by 'modOrder'
+yy$name <- factor(yy$name, levels = noOrder)
+
+# Arrange the data frame by the 'name' column
+yy <- yy %>% arrange(name)
+
+  # Convert 'name' to a factor with levels specified by 'modOrder'
+yy$season <- factor(yy$season, levels = seasonOrder)
+
+# Arrange the data frame by the 'name' column
+noneBoxplotInputData <- yy %>% arrange(name, season)
+    
+bxp <- ggboxplot(noneBoxplotInputData, x = "season", y = "weight",
+                 fill = "jurisdiction",
+                 color = "grey30",
+               outlier.shape = 16, outlier.colour = "grey30", outlier.alpha = 0.6,
+               outlier.size = 0.5) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10)))+ 
+  geom_pwc(method = "dunn_test", label = "p.signif", hide.ns = "p.adj") +
+  facet_wrap(~name, scales = "free_y", nrow = 3) +
+   scale_fill_manual(values = jurPal) +
+      theme_classic() +
+      theme(legend.position = "bottom",
+            axis.title = element_text(size = 14),  # Adjust axis title size
+            axis.text = element_text(size = 14),
+            axis.text.x = element_text(angle = 45, hjust = 1),# Adjust axis text size
+            plot.title = element_text(size = 14),
+            strip.text = element_text(size = 16),
+            legend.text = element_text(size = 14),
+            strip.background = element_blank(),  # Remove the background of strip labels
+    strip.placement = "outside") +
+    facet_wrap(~ name, scales = "free_y", nrow = 3) +
+    labs(
+        x = "Arrival location",
+        y = expression("Daily TWSA values (m"^2*")"),
+        group = season,
+        fill = "Source jurisdiction")
+
+    if(saveOutputs == TRUE) {
+      ggsave(file.path(manuscriptFigures, 
+                       paste0(Sys.Date(), "-", "figure3Boxplots.png")), 
+             plot = bxp, width = 10, height = 10, units = "in",
+             dpi = 600)
+    }
+
+
+```
+
+
+## Supporting information all boxplots
+
+```{r all boxplots}
+
+categoryEdgeLists <- split(masterDailyEdgeList, masterDailyEdgeList$category)
+
+categoryBoxplots <- vector(mode = "list", length = length(categoryEdgeLists))
+
+for (i in seq_along(categoryEdgeLists)) {
+
+yy <- categoryEdgeLists[[i]] %>% 
+      mutate(ToPort = ifelse(ToPort == "NZ_NZ", "New Zealand_NZ", ToPort)) 
+
+yy$name <- gsub("_NZ", "", yy$ToPort)
+     
+      
+alphabeticalOrder <- sort(unique(yy$name))
+  
+# Convert 'name' to a factor with levels specified by 'alphabeticalOrder'
+yy$name <- factor(yy$name, levels = alphabeticalOrder)
+
+# Arrange the data frame by the 'name' column
+yy <- yy %>% arrange(name)
+
+  # Convert 'season' to a factor with levels specified by 'seasonOrder'
+yy$season <- factor(yy$season, levels = seasonOrder)
+
+# Arrange the data frame by the 'name' column
+df <- yy %>% arrange(name, season)
+
+# Make a label to save
+
+saveLabel <- unique(yy$category)
+saveLabel <- str_replace_all(saveLabel," ", "")
+saveLabel <- str_replace_all(saveLabel,"-", "_")
+saveLabel <- str_replace_all(saveLabel," ", "_")
+saveLabel <- str_replace_all(saveLabel,"seasonalpattern", "")
+    
+categoryBoxplots[[i]] <- ggboxplot(df, x = "season", y = "weight",
+                 fill = "jurisdiction",
+                 color = "grey30",
+               outlier.shape = 16, outlier.colour = "grey30", outlier.alpha = 0.6,
+               outlier.size = 0.5) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10)))+ 
+  geom_pwc(method = "dunn_test", label = "p.signif", hide.ns = "p.adj") +
+  facet_wrap(~name, scales = "free_y", nrow = 3) +
+   scale_fill_manual(values = jurPal) +
+      theme_classic() +
+      theme(legend.position = "bottom",
+            axis.title = element_text(size = 14),  # Adjust axis title size
+            axis.text = element_text(size = 14),
+            axis.text.x = element_text(angle = 45, hjust = 1),# Adjust axis text size
+            plot.title = element_text(size = 14),
+            strip.text = element_text(size = 12),
+            legend.text = element_text(size = 14),
+            strip.background = element_blank(),  # Remove the background of strip labels
+    strip.placement = "outside") +
+    facet_wrap(~ name, scales = "free_y", nrow = 6) +
+    labs(
+        x = "Arrival location",
+        y = expression("Daily TWSA values (m"^2*")"),
+        group = season,
+        fill = "Source jurisdiction")
+
+
+    if(saveOutputs == TRUE) {
+      ggsave(file.path(supportingFigures,
+                       paste0(Sys.Date(), "-", saveLabel, "supportingInfoBoxplots.png")),
+             plot = categoryBoxplots[[i]], width = 16, height = 12, units = "in",
+             dpi = 600, create.dir = TRUE)
+    }
+
+}
+
+```
+
+```{r average spatial edge data}
+
+# Note, at the moment this loop produces drops all the internaitonal edges
+# because it merges into new zealand only spatial data, however I'm leaving the structure
+# in case we want to also evaluate edges in the future
+
+annualEdgesSpatialList <- list()
+
+for (i in seq_along(dailyEdgesCompleteList2)) {
+  
+  dailyEdgesComplete <- dailyEdgesCompleteList2[[i]]
+  
+  annualEdgeList <- dailyEdgesComplete %>% 
+                       # For each edge
+                       group_by(edgeName) %>%
+                       # Calculate the mean TWSA    
+                       mutate(weight = mean(totalTWSA, na.rm = TRUE)) %>% 
+                       ungroup() %>%
+                       dplyr::select(edgeName, FrPort, ToPort, weight) %>%
+                       distinct(.)
+  
+
+  # Put edge list into spatial format for map
+  annualEdgeListSpatial <- prepSpatialEdges(annualEdgeList, "test", nodesNZ)
+  
+  # hist(annualEdgeListSpatial$weight, breaks = 100)
+  # summary(annualEdgeListSpatial$weight)
+  
+  # For the time being, remove all edges with TWSA < 5000
+  
+  # TEMPORARY CODE
+  
+  annualEdgeListSpatial <- annualEdgeListSpatial %>%
+                           filter(weight > 4.466) %>% # median
+                           mutate(type = jurisdictions[i])
+  
+  annualEdgesSpatialList[[i]] <- annualEdgeListSpatial
+  
+  rm(annualEdgeListSpatial)
+  
+}
+
+```
+
+```{r combine edges}
+
+# Combine the dom and international edges into one dataframe
+annualEdgeListSpatial <- do.call(rbind, annualEdgesSpatialList)
+
+```
+
+# Maps
+
+## Prep the map data
+
+```{r ridge plots}
+
+# incoming - assign edge weights to timesteps based on their arrival day
+incomingEdges <- asynchronousEdgeList %>%
+                 dplyr::select(FrPort, ToPort, endDay, meanProxy, meanMovements, code) %>%
+                 mutate(timeStep = endDay) %>%
+                 rename(incomingProxy = meanProxy) %>%
+                 ungroup(.) %>%
+                 arrange(FrPort, ToPort, timeStep) %>%
+  mutate(jurisdiction = ifelse(code == 4, "international",
+                               ifelse(code == 1 | code == 2,
+                                      "domestic",
+                                      NA))) %>%
+  filter(!is.na(jurisdiction))
+
+# Add spatial info so we can order top to bottom
+
+incomingEdgesNZ <- incomingEdges %>%
+  filter(grepl("_NZ$", ToPort)) %>%
+  # merge(nodesNZ[c("Name", "Lat", "Lon")], by.x = "ToPort",
+  #             by.y = "Name")
+  select(ToPort, endDay, incomingProxy, jurisdiction, meanMovements) %>%
+  distinct(.) %>%
+  group_by(ToPort, endDay, jurisdiction) %>%
+  #sum the diff edges arriving at the same port on the same day from either domestic or intnl source
+  summarise(incomingProxy = sum(incomingProxy),
+            movements = sum(meanMovements, na.rm = TRUE)) %>%
+  group_by(ToPort, jurisdiction) %>%
+  mutate(meanDailyMovements = sum(movements,na.rm = TRUE)/366) %>%
+  ungroup()
+
+# check how it looks for a port we know has itnl and domestic traffic
+
+inedgescheck <- incomingEdgesNZ %>% filter(ToPort == "Auckland_NZ")
+
+tempresultscheck <- temporalResultsSpatialDF %>% filter(Name == "Auckland_NZ")
+# Merge what we know about the seasonal variability
+
+incomingEdgesAndCV <- incomingEdgesNZ %>%
+               merge(temporalResultsSpatialDF[c("Name", "season", "seasonalCV",
+                                              "Lat", "Lon", "geometry", "jurisdiction")],
+                     by.x = c("ToPort","jurisdiction"),
+                     by.y = c("Name", "jurisdiction")) %>%
+               mutate(ToPort = str_sub(ToPort, 1, -4))
+
+# Look at the distribution of mean movements
+
+movementData <- incomingEdgesAndCV %>%
+                select(ToPort, meanDailyMovements) %>%
+                distinct()
+
+belowMedian <- movementData %>% filter(meanDailyMovements < 0.02732)
+
+movementThreshold <- quantile(movementData$meanDailyMovements)[2]
+
+```
+
+## Categorise the ports by seasonality and CV
+
+```{r categorise}
+# Let's have a look at a histogram of the seasonal CVs
+
+densityData <- incomingEdgesAndCV %>% 
+               # Add a category based on seasonality and CV
+  # Add a category based on seasonality and CV
+   mutate(subCategory = ifelse(season == TRUE & seasonalCV <= maxThresholdCV, 
+                              "moderate seasonal pattern",
+                              ifelse(season == TRUE & seasonalCV > maxThresholdCV, 
+                               "high seasonal pattern",
+                              ifelse(season == FALSE,
+                               "no seasonal pattern", NA)))) %>% 
+               mutate(category = paste(jurisdiction, subCategory, sep = " - ")) %>% 
+               dplyr::select(ToPort, endDay, incomingProxy, jurisdiction, 
+                             subCategory, category, Lat, Lon, seasonalCV,meanDailyMovements) %>%
+               distinct(.)
+
+table(densityData$subCategory)
+table(densityData$category)
+
+
+# Add empty rows for international high CV
+
+internationalhighCV <- densityData %>% 
+  # grab a single row to get the structure              
+                       slice(1) %>% 
+                       # Fill the rows with 0
+                       mutate(category = "international - high seasonal pattern",
+                              jurisdiction = "international",
+                              incomingProxy = 0,
+                              seasonalCV = 0) 
+
+densityData <- rbind(densityData, internationalhighCV)
+
+# Check we have all categories present
+# as.data.frame(table(densityData$category))
+# length(unique(densityData$category))
+# Re-order by latitude (so ports are in order of north to south)
+densityData <- transform(densityData, ToPort = reorder(ToPort, Lat))
+
+```
+
+```{r add a NZ ridge}
+
+maxThresholdCV <- deciles[6]
+
+temporalResultsSpatialNZ <- temporalResultsSpatialDF %>% filter(jurisdiction == "national")
+
+# Calculate total TWSA per day coming into NZ on average
+nzDensity <- densityData %>% 
+             group_by(endDay) %>% 
+             mutate(incomingProxy = sum(incomingProxy),
+                    jurisdiction = "national",
+                    ToPort = "NZ_NZ") %>%
+             select(-category, -subCategory, -Lat, -Lon, -seasonalCV) %>% 
+             distinct(.)
+
+# Add spatial info just for NZ
+
+nzDensity <- nzDensity %>% 
+             merge(temporalResultsSpatialNZ[c("Name", "season", "seasonalCV",
+                                              "Lat", "Lon", "geometry", "jurisdiction")], 
+                     by.x = c("ToPort","jurisdiction"),
+                     by.y = c("Name", "jurisdiction")) %>% 
+               mutate(ToPort = str_sub(ToPort, 1, -4)) %>% 
+            mutate(subCategory = ifelse(season == TRUE & seasonalCV <= maxThresholdCV, 
+                              "moderate seasonal pattern",
+                              ifelse(season == TRUE & seasonalCV > maxThresholdCV, 
+                               "high seasonal pattern",
+                              ifelse(season == FALSE,
+                               "no seasonal pattern", NA)))) %>% 
+               mutate(category = paste(jurisdiction, subCategory, sep = " - ")) %>% 
+               dplyr::select(ToPort, endDay, incomingProxy, jurisdiction, 
+                             subCategory, category, Lat, Lon, seasonalCV, meanDailyMovements) %>%
+               distinct(.)
+
+# Add it back into the density data
+
+densityData2 <- rbind(densityData, nzDensity)
+
+```
+
+
+```{r order the categories}
+
+cats <- unique(densityData2$category)
+
+# Grab them straight from the data so we don't end up with mismatched spelling
+ordered_levels <- c(cats[7], #national
+                    cats[6], #int high
+                    cats[1], #dom high
+                    cats[5], #int low
+                    cats[2], #dom low
+                    cats[3], #int na 
+                    cats[4]) #dom na high
+
+# Make some labels for our plots in the correct order
+abbreviations <- c(
+  "nationalCVHigh",
+  "internationalCVHigh",
+  "domesticCVHigh",
+  "internationalCVModerate",
+  "domesticCVModerate",
+  "internationalNone",
+   "domesticNone"
+)
+
+# Convert the 'category' column to an ordered factor with the defined levels
+densityData2$category <- factor(densityData2$category, levels = ordered_levels, ordered = TRUE)
+
+```
+
+## Make individual port datasets for reference
+
+```{r save port data}
+
+# Check/make folder to put it
+
+dirPath <-  file.path(cleanOutputs, manuscriptVersion,
+                        "portDataAverageTWSAPerDay")
+
+if(!dir.exists(dirPath)) {
+  
+  dir.create(dirPath, recursive = TRUE)
+  
+}
+
+x <- densityData2 %>% split(.$jurisdiction)
+
+dom <- x[[1]]
+
+international <- x[[2]]
+
+national <- x[[3]]
+
+domList <- dom %>% split(.$ToPort)
+
+intList <- international %>% split(.$ToPort)
+
+natList <- national %>% split(.$ToPort)
+
+all <- c(domList, intList, natList)
+
+out <- list()
+
+for (i in seq_along(all)) {
+  
+  portName <- all[[i]]$ToPort[1]
+  portJurisdiction <- all[[i]]$jurisdiction[1]
+  
+  out[[i]] <- all[[i]] %>% 
+    select(ToPort, endDay, incomingProxy, jurisdiction, subCategory, seasonalCV) %>% 
+    distinct(.) %>% 
+    rename(averageAnnualIncomingTWSA = incomingProxy,
+           dayOfYear = endDay,
+           portName = ToPort,
+           sourcePortJurisdiction = jurisdiction) %>% 
+    arrange(dayOfYear)
+  
+  if(saveOutputs == TRUE) {
+    
+    write.csv(out[[i]], file.path(
+      dirPath, paste0(Sys.Date(),portName, portJurisdiction, ".csv")))
+  }
+
+}
+
+```
+
+## Fig 2 - 4: maps & shapefiles
+
+```{r map list}
+
+densityData3 <- densityData2 %>% filter(jurisdiction != "national")
+
+densityMapList <- split(densityData3, densityData3$subCategory)
+
+subCategoryAbbreviations <- abbreviate(unique(densityData3$subCategory))
+subCategoryAbbreviations
+
+```
+
+```{r make CV breaks and palette}
+
+colpal <- c("1" = "#012f48","2" = "#014a71","3" = "#006b94", "4" = "#008eb5", "5" = "#00b3d3", "6" = "#00d9eb", "7" = "#14ffff")
+
+```
+
+```{r cv custom breaks}
+
+# Define custom breaks
+custom_breaks <- c(0, 5, 10, 20, 30, 50, 100, 175)
+
+# Add a new column for custom binned values
+masterResultsTable <- masterResultsTable %>%
+                      mutate(custom_binned_seasonalCV = 
+                             cut(seasonalCV, breaks = custom_breaks, include.lowest = TRUE)) %>%
+                      mutate(cvBins = as.factor(as.numeric(custom_binned_seasonalCV))) %>% 
+                      mutate(incomingProxy = Summer + Autumn + Winter + Spring)
+
+# head(masterResultsTable$custom_binned_seasonalCV)
+
+```
+
+## Save category map data for GIS
+
+But we will still make maps in R as well for reference
+
+```{r make corresponding maps}
+
+categories <- c("strong", "moderate", "none")
+
+densityMapList <- split(masterResultsTable, masterResultsTable$subCategory)
+
+mapList <- list()
+
+for(i in seq_along(densityMapList)) {
+  
+catLabel <- densityMapList[[i]]$subCategory[1]
+abbr <- categories[i]
+
+densityMapList[[i]] <- densityMapList[[i]] %>%
+  mutate(outline_color = ifelse(exemplar, "red", as.character(ToPort))) %>% 
+  arrange(exemplar) %>% 
+  mutate(sumTWSA = Summer + Autumn + Winter + Spring) 
+
+# Map the fill color to the new variable using the color palette
+mapList[[i]] <- ggplot() + 
+  geom_sf(data = NZCoast2000,
+          aes(fill = Population, col = Population)) +
+  scale_fill_gradient(high = "grey50", low = "grey90", guide = "none") +
+  scale_color_gradient(high = "grey50", low = "grey90", guide = "none") +
+  new_scale_fill() +
+  new_scale_color() +
+  geom_point(data = densityMapList[[i]],
+             aes(fill = cvBins,
+                 col = cvBins,
+                 x = Lon, y = Lat,
+                 size = incomingProxy),  
+             stroke = 0,
+             shape = 21) +
+  scale_fill_manual(values = colpal, name = "test") +  # Use manual scale for colors
+  scale_color_manual(values = colpal) +
+  scale_size_continuous(range = c(5, 15)) +
+  coord_sf(datum = st_crs(NZCoast),
+           xlim = c(870000, 2200000), ylim = c(4600000, 6200000)) +
+  theme(legend.position = "none",
+        legend.box = "horizontal",
+        legend.box.just = "left",
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "white", color = "black")) +
+  guides(shape = guide_legend(title = "jurisdiction", 
+                              override.aes = list(size = 4))) +  # Show only shape legend
+  annotation_scale(location = 'br', style = "ticks") +
+  annotation_north_arrow(location = 'br', height = unit(0.55, "cm"),
+                         width = unit(0.35, "cm"),
+                         pad_y = unit(1, "cm")) +
+  xlab(NULL) 
+
+  if(saveOutputs == TRUE) {
+
+  ggsave(file.path(manuscriptFigures, 
+                   paste0(Sys.Date(),abbr,"Map.png")),
+                   mapList[[i]],  device = "png", dpi = 600,
+                   height = 22, width = 18, units = "cm")
+    
+  st_write(densityMapList[[i]],
+           file.path(cleanOutputs, manuscriptVersion,
+                     paste0(Sys.Date(),"-",abbr,".shp")),
+           append = FALSE)
+
+  }
+
+}
+
+# walk(mapList, print)
+
+```
+
+## Spawning x shipping pressure 
+
+Calculate the % of incoming TWSA that occurs during different spawning periods
+TODO: split by domestic or not?? too tired to think through properly rn
+
+Calculate the average amount of TWSA that arrives at each port in an average year
+
+```{r ave annual twsa}
+
+nodeMeanAnnualTWSA <- masterDailyEdgeList %>% 
+                  ungroup(.) %>% 
+                  filter(seasonalDifference == TRUE) %>% 
+                  group_by(ToPort, year, jurisdiction) %>% 
+                  mutate(yearlyTWSA = sum(weight)) %>%
+                  ungroup(.) %>%
+                  select(ToPort, year, jurisdiction, yearlyTWSA) %>%
+                  distinct(.) %>% 
+                  group_by(ToPort, jurisdiction) %>%
+                  mutate(annualTWSA = sum(yearlyTWSA)/4) %>% 
+                  ungroup() %>% 
+                  select(ToPort, jurisdiction, annualTWSA) %>%
+                  distinct() %>% 
+                  #make km 2 to make numbers smaller
+                  mutate(subsetTWSA = annualTWSA,
+                         percentRisk = subsetTWSA/annualTWSA,
+                         spawningType = "Continuous (jan:dec)") %>% 
+                  select(ToPort, jurisdiction, annualTWSA, subsetTWSA, 
+                        percentRisk, spawningType) %>% 
+                  arrange(desc(subsetTWSA))
+```
+
+Calculate the amount of TWSA that arrives during spawning season
+
+```{r spwaning function}
+
+getSpawningTWSA <- function(data, annualData, spawningStart, spawningEnd, Label) {
+
+# Filter the data for the spawning season
+    
+subsetDailyEdgeList <- data %>%
+      filter(month(endDatex) %in% spawningStart:spawningEnd) %>%
+      filter(!(month(endDatex) == spawningStart & day(endDatex) < 1)) %>%
+      filter(!(month(endDatex) == spawningEnd & day(endDatex) > 30)) %>% 
+      filter(seasonalDifference == TRUE)
+    
+# Summarize subsetDailyEdgeList
+summary_data <- subsetDailyEdgeList %>% 
+  group_by(ToPort, year, jurisdiction) %>% 
+  summarize(yearlySubsetTWSA = sum(weight), .groups = 'drop') %>%
+  group_by(ToPort, jurisdiction) %>%
+  summarize(subsetTWSA = sum(yearlySubsetTWSA)/4, .groups = 'drop')
+
+# Merge with annualData
+outdf <- summary_data %>%
+  merge(annualData[c("ToPort", "jurisdiction", "annualTWSA")], by = c("ToPort", "jurisdiction")) %>%
+  select(ToPort, jurisdiction, annualTWSA, subsetTWSA) %>%
+  mutate(percentRisk = subsetTWSA / annualTWSA,
+         spawningType = Label) %>%
+  arrange(desc(subsetTWSA)) 
+                  
+return(outdf)
+}
+```
+
+```{r get spawning TWSA}
+
+springTWSA <- getSpawningTWSA(data = masterDailyEdgeList, 
+                              annualData = nodeMeanAnnualTWSA, 
+                              spawningStart = 9, 
+                              spawningEnd = 11, 
+                              Label = "Spring (sep:nov)") %>% filter(jurisdiction != "national")
+
+springSummerTWSA <- getSpawningTWSA(masterDailyEdgeList, nodeMeanAnnualTWSA, 9, 2, "Spring/Summer (sep:feb)")
+
+winterTWSA <- getSpawningTWSA(masterDailyEdgeList, nodeMeanAnnualTWSA, 6, 8, "Winter (jun:aug)")
+
+allSpawningTWSA <- rbind(nodeMeanAnnualTWSA, springTWSA, springSummerTWSA, winterTWSA)
+
+allSpawningTWSA <- allSpawningTWSA %>% 
+                   mutate(jurisdiction = ifelse(jurisdiction == "international",
+                                                 "Intnl",
+                                                ifelse(jurisdiction == "domestic",
+                                                       "Domest",jurisdiction))) %>%
+                   mutate(spawningJurisdiction = paste0(jurisdiction, " ", spawningType))
+
+if(any(allSpawningTWSA$percentRisk > 1)) {
+  stop("Percent risk is greater than 1")
+}
+
+# Define the desired order
+desiredOrder <- c(
+  "Intnl Continuous (jan:dec)",
+  "Intnl Winter (jun:aug)",
+  "Intnl Spring (sep:nov)",
+  "Intnl Spring/Summer (sep:feb)",
+  "Domest Continuous (jan:dec)",
+  "Domest Winter (jun:aug)",
+  "Domest Spring (sep:nov)",
+  "Domest Spring/Summer (sep:feb)",
+  "national Continuous (jan:dec)",
+  "national Winter (jun:aug)",
+  "national Spring (sep:nov)",
+  "national Spring/Summer (sep:feb)"
+)
+
+# Assuming your dataframe is named df and the column is named 'group'
+allSpawningTWSA$spawningJurisdiction <- factor(allSpawningTWSA$spawningJurisdiction, 
+                                               levels = desiredOrder, ordered = TRUE)
+
+```
+
+```{r save spawning lists}
+
+spawningToSave <- rbind(springTWSA, springSummerTWSA, winterTWSA) %>% 
+                  filter(jurisdiction != "national") %>%
+                   mutate(jurisdiction = ifelse(jurisdiction == "international",
+                                                 "Intnl",
+                                                ifelse(jurisdiction == "domestic",
+                                                       "Domest",jurisdiction))) %>%
+                   mutate(spawningJurisdiction = paste0(jurisdiction, " ", spawningType))
+
+spawningTables <- split(spawningToSave, spawningToSave$spawningJurisdiction)
+
+if(saveOutputs == TRUE) {
+  
+  for(i in seq_along(spawningTables)) {
+    
+   label <- spawningTables[[i]]$spawningJurisdiction[1]
+   label <- gsub(" ", "_", label)
+   label <- str_remove(label, "_[^_]*$")
+   label <- gsub("/", "-", label)
+   
+   print(label)
+   
+   df <- spawningTables[[i]] 
+   
+   write.csv(df, 
+             file.path(supportingFigures, paste0("spawningTWSA_", label, ".csv")),
+             row.names = FALSE)
+  }
+  
+}  
+  
+```
+
+## Fig 5: Seasonal spawning data and maps
+
+Export shapefiles for GIS but still keep the R figure for reference
+
+```{r map spawning TWSA}
+
+mapData <- allSpawningTWSA %>% 
+           merge(nodesNZ, by.x = "ToPort", by.y = "Name")  %>% 
+           filter(ToPort != "NZ_NZ",
+                  #jurisdiction == "international",
+                  subsetTWSA !=0)
+
+spawningMap <- ggplot() + 
+  geom_sf(data = NZCoast2000,
+          aes(fill = Population, col = Population)) +
+  scale_fill_gradient(high = "grey50", low = "grey90", guide = "none") +
+  scale_color_gradient(high = "grey50", low = "grey90", guide = "none") +
+  new_scale_fill() +
+  new_scale_color() +
+  geom_point(data = mapData,
+             aes(col = percentRisk, fill = percentRisk, 
+                 x = Lon, y = Lat, 
+                 size = subsetTWSA),  
+             stroke = 0.25) +
+  scale_fill_viridis_c(option = "magma", 
+                       name = "Percentage of annual incoming sum of TWSA", 
+                       direction = -1,
+                       na.value = "grey80") +
+  scale_color_viridis_c(option = "magma", 
+                       name = "Percentage of annual incoming sum of TWSA", 
+                       direction = -1,
+                       na.value = "grey80") +
+  scale_size_continuous(name = expression("Cumulative TWSA arriving at port (m"^2*")"),
+                        range = c(2, 10)) +
+  coord_sf(datum = st_crs(NZCoast),
+           xlim = c(870000, 2200000), ylim =  c(4600000, 6200000)) +
+  theme(legend.position = "bottom",
+        legend.box = "vertical",
+        legend.box.just = "left",
+        strip.text = element_text(size = 12),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "white", color = "black")) +
+  annotation_scale(location = 'br', style = "ticks") +
+  annotation_north_arrow(location = 'br', height = unit(0.55, "cm"),
+                         width = unit(0.35, "cm"),
+                         pad_y = unit(1, "cm")) +
+  xlab(NULL) +
+  facet_wrap(~spawningJurisdiction, nrow = 2)
+
+if(saveOutputs == TRUE) {
+# Save the plot
+ggsave(file.path(manuscriptFigures,
+                 paste0("spawnMapLandscape_",
+                        manuscriptVersion,
+                        ".png")), plot = spawningMap, 
+       width = 12,height = 8.3, units = "in", dpi = 600)
+  
+st_write(mapData, file.path(cleanOutputs, manuscriptVersion,
+         "spawnMapData.shp"))
+  
+}
+
+```
+
+
+
