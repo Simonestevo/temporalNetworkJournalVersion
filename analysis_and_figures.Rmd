@@ -220,7 +220,7 @@ timeStatus <- function(data, columnName) {
 
 ```{r user inputs}
 
-manuscriptVersion <- "v13"
+manuscriptVersion <- "v14"
 
 saveOutputs <- TRUE
 
@@ -300,7 +300,30 @@ projectData <- "S:/RDS28221-BiosecurityToolbox/projectData/4_cleanOutputs/"
 
 ```{r load data, include = FALSE}
 
+# Vessel data, cleaned by Eric
+load(file.path(inputs, "commercial_MTVesselData_Country_ET_17Aug2022.Rdata"))
 
+# Cleaned edge list at vessel resolution (produced by
+# https://github.com/Simonestevo/RA1.4_Commercial/blob/main/2_calculateVesselTWSA.Rmd)
+VesEdgeList <- readRDS(file.path(inputs,"Clean_commercialEdgeListTWSA_SS_4.rds" ))
+
+#dailyEdgesIncomplete <- readRDS(file.path(inputs, "Clean_commercialAllDaysIncomingTWSA_SS_3.rds"))
+dailyEdgesIncomplete <- readRDS(file.path(inputs, "Clean_commercialAllDaysIncomingTWSA_SS_4new.rds"))
+
+# Asynchronous edge list where start and end days of edge journeys are recorded (produced by
+# https://github.com/Simonestevo/RA1.4_Commercial/blob/main/3_calculateEdgeTWSA.Rmd)
+asynchronousEdgeList <- readRDS(file.path(inputs, "Clean_commercialAsynchEdgesTWSA_SS_10.rds" )) 
+
+# Spatial data
+
+# All commercial nodes, including cruise ships etc, cleaned to fix country codes also, produce
+# by: https://github.com/Simonestevo/RA1.4_Commercial/blob/main/1_prepCommercialNodes.Rmd
+
+commercialNodes <- st_read(file.path(inputs, "Clean_commercialNodesWGS84_SS_1.shp"))
+
+# Shapefile of NZ for maps
+
+NZCoast2000 <- st_read(file.path(inputs,"regional-council-2020-generalised_clipped_to_coast_NZTM_pop2018.shp"), quiet = TRUE)
 
 ```
 
@@ -1235,7 +1258,7 @@ heatmapPlot <- ggplot(heatmapData, aes(x = Comparison, y = name, fill = Z)) +
     strip.text.y = element_text(angle = 90, size = 12),
     panel.spacing = unit(0.75, "lines")
   ) +
-  labs(x = "Daily TWSA Comparison", y = "Arrival location") +
+  labs(x = "Seasonal comparison", y = "Arrival location") +
   facet_grid(jurisdictionAbbr ~ ., scales = "free_y", space = "free_y", switch = "both")
 # Print the plot
 print(heatmapPlot)
@@ -1747,23 +1770,29 @@ yy$season <- factor(yy$season, levels = seasonOrder)
 # Arrange the data frame by the 'name' column
 df <- yy %>% arrange(name, season) 
 
+# Set fonsize
+
+fontsize <- 16
+
 bxp <- ggboxplot(df, x = "season", y = "weight",
                  fill = "jurisdiction",
                  color = "grey30",
                outlier.shape = 16, outlier.colour = "grey30", outlier.alpha = 0.6,
                outlier.size = 0.5) +
   scale_y_continuous(expand = expansion(mult = c(0.05, 0.10)))+ 
-  geom_pwc(method = "dunn_test", label = "p.signif", hide.ns = "p.adj") +
+  geom_pwc(method = "dunn_test", label = "p.signif", hide.ns = "p.adj",
+           size = 0.3, label.size = 4) +
   facet_wrap(~name, scales = "free_y", nrow = 3) +
    scale_fill_manual(values = jurPal) +
       theme_classic() +
       theme(legend.position = "bottom",
-            axis.title = element_text(size = 14),  # Adjust axis title size
-            axis.text = element_text(size = 14),
+            axis.title = element_text(size = fontsize),  # Adjust axis title size
+            axis.text = element_text(size = fontsize),
             axis.text.x = element_text(angle = 45, hjust = 1),# Adjust axis text size
-            plot.title = element_text(size = 14),
-            strip.text = element_text(size = 16),
-            legend.text = element_text(size = 14),
+            plot.title = element_text(size = fontsize),
+            strip.text = element_text(size = fontsize),
+            legend.text = element_text(size = fontsize),
+            legend.title = element_text(size = fontsize),
             strip.background = element_blank(),  # Remove the background of strip labels
     strip.placement = "outside") +
     facet_wrap(~ name, scales = "free_y", nrow = 3) +
@@ -1775,7 +1804,8 @@ bxp <- ggboxplot(df, x = "season", y = "weight",
 
     if(saveOutputs == TRUE) {
       ggsave(file.path(manuscriptFigures, 
-                       paste0(Sys.Date(), "-", "figure4Boxplots.png")), 
+                       paste0(Sys.Date(), "-", "figure4Boxplots",
+                       manuscriptVersion,".png")), 
              plot = bxp, width = 5, height = 10, units = "in",
              dpi = 600)
     }
@@ -1814,17 +1844,19 @@ bxp <- ggboxplot(modBoxplotInputData, x = "season", y = "weight",
                outlier.shape = 16, outlier.colour = "grey30", outlier.alpha = 0.6,
                outlier.size = 0.5) +
   scale_y_continuous(expand = expansion(mult = c(0.05, 0.10)))+ 
-  geom_pwc(method = "dunn_test", label = "p.signif", hide.ns = "p.adj") +
+  geom_pwc(method = "dunn_test", label = "p.signif", hide.ns = "p.adj",
+           size = 0.3, label.size = 4) +
   facet_wrap(~name, scales = "free_y", nrow = 3) +
    scale_fill_manual(values = jurPal) +
       theme_classic() +
       theme(legend.position = "bottom",
-            axis.title = element_text(size = 14),  # Adjust axis title size
-            axis.text = element_text(size = 14),
+            axis.title = element_text(size = fontsize),  # Adjust axis title size
+            axis.text = element_text(size = fontsize),
             axis.text.x = element_text(angle = 45, hjust = 1),# Adjust axis text size
-            plot.title = element_text(size = 14),
-            strip.text = element_text(size = 16),
-            legend.text = element_text(size = 14),
+            plot.title = element_text(size = fontsize),
+            strip.text = element_text(size = fontsize),
+            legend.text = element_text(size = fontsize),
+            legend.title = element_text(size = fontsize),
             strip.background = element_blank(),  # Remove the background of strip labels
     strip.placement = "outside") +
     facet_wrap(~ name, scales = "free_y", nrow = 3) +
@@ -1835,8 +1867,9 @@ bxp <- ggboxplot(modBoxplotInputData, x = "season", y = "weight",
         fill = "Source jurisdiction") 
 
     if(saveOutputs == TRUE) {
-      ggsave(file.path(manuscriptFigures, 
-                       paste0(Sys.Date(), "-", "figure3Boxplots.png")), 
+   ggsave(file.path(manuscriptFigures, 
+                       paste0(Sys.Date(), "-", "figure2Boxplots",
+                       manuscriptVersion,".png")), 
              plot = bxp, width = 10, height = 10, units = "in",
              dpi = 600)
     }
@@ -1875,17 +1908,19 @@ bxp <- ggboxplot(noneBoxplotInputData, x = "season", y = "weight",
                outlier.shape = 16, outlier.colour = "grey30", outlier.alpha = 0.6,
                outlier.size = 0.5) +
   scale_y_continuous(expand = expansion(mult = c(0.05, 0.10)))+ 
-  geom_pwc(method = "dunn_test", label = "p.signif", hide.ns = "p.adj") +
+  geom_pwc(method = "dunn_test", label = "p.signif", hide.ns = "p.adj",
+           size = 0.3, label.size = 4) +
   facet_wrap(~name, scales = "free_y", nrow = 3) +
    scale_fill_manual(values = jurPal) +
       theme_classic() +
       theme(legend.position = "bottom",
-            axis.title = element_text(size = 14),  # Adjust axis title size
-            axis.text = element_text(size = 14),
+            axis.title = element_text(size = fontsize),  # Adjust axis title size
+            axis.text = element_text(size = fontsize),
             axis.text.x = element_text(angle = 45, hjust = 1),# Adjust axis text size
-            plot.title = element_text(size = 14),
-            strip.text = element_text(size = 16),
-            legend.text = element_text(size = 14),
+            plot.title = element_text(size = fontsize),
+            strip.text = element_text(size = fontsize),
+            legend.text = element_text(size = fontsize),
+            legend.title = element_text(size = fontsize),
             strip.background = element_blank(),  # Remove the background of strip labels
     strip.placement = "outside") +
     facet_wrap(~ name, scales = "free_y", nrow = 3) +
@@ -1896,8 +1931,9 @@ bxp <- ggboxplot(noneBoxplotInputData, x = "season", y = "weight",
         fill = "Source jurisdiction")
 
     if(saveOutputs == TRUE) {
-      ggsave(file.path(manuscriptFigures, 
-                       paste0(Sys.Date(), "-", "figure3Boxplots.png")), 
+   ggsave(file.path(manuscriptFigures, 
+                       paste0(Sys.Date(), "-", "figure3Boxplots",
+                       manuscriptVersion,".png")), 
              plot = bxp, width = 10, height = 10, units = "in",
              dpi = 600)
     }
@@ -1950,17 +1986,19 @@ categoryBoxplots[[i]] <- ggboxplot(df, x = "season", y = "weight",
                outlier.shape = 16, outlier.colour = "grey30", outlier.alpha = 0.6,
                outlier.size = 0.5) +
   scale_y_continuous(expand = expansion(mult = c(0.05, 0.10)))+ 
-  geom_pwc(method = "dunn_test", label = "p.signif", hide.ns = "p.adj") +
+  geom_pwc(method = "dunn_test", label = "p.signif", hide.ns = "p.adj",
+           size = 0.3, label.size = 4) +
   facet_wrap(~name, scales = "free_y", nrow = 3) +
    scale_fill_manual(values = jurPal) +
       theme_classic() +
       theme(legend.position = "bottom",
-            axis.title = element_text(size = 14),  # Adjust axis title size
-            axis.text = element_text(size = 14),
+            axis.title = element_text(size = fontsize),  # Adjust axis title size
+            axis.text = element_text(size = fontsize),
             axis.text.x = element_text(angle = 45, hjust = 1),# Adjust axis text size
-            plot.title = element_text(size = 14),
-            strip.text = element_text(size = 12),
-            legend.text = element_text(size = 14),
+            plot.title = element_text(size = fontsize),
+            strip.text = element_text(size = fontsize),
+            legend.text = element_text(size = fontsize),
+            legend.title = element_text(size = fontsize),
             strip.background = element_blank(),  # Remove the background of strip labels
     strip.placement = "outside") +
     facet_wrap(~ name, scales = "free_y", nrow = 6) +
@@ -1973,7 +2011,8 @@ categoryBoxplots[[i]] <- ggboxplot(df, x = "season", y = "weight",
 
     if(saveOutputs == TRUE) {
       ggsave(file.path(supportingFigures,
-                       paste0(Sys.Date(), "-", saveLabel, "supportingInfoBoxplots.png")),
+                       paste0(Sys.Date(), "-", saveLabel, 
+                              "supportingInfoBoxplots", manuscriptVersion,".png")),
              plot = categoryBoxplots[[i]], width = 16, height = 12, units = "in",
              dpi = 600, create.dir = TRUE)
     }
@@ -2036,6 +2075,24 @@ annualEdgeListSpatial <- do.call(rbind, annualEdgesSpatialList)
 # Maps
 
 ## Prep the map data
+
+```{r nz map data}
+
+ if(saveOutputs == TRUE) {
+   
+  node_shp <- nodesNZ %>% select(name, geometry)%>%
+  filter(!str_detect(name, regex("anch|anchorage", ignore_case = TRUE)))%>%
+  filter(!str_detect(name, regex("New Zealand", ignore_case = TRUE)))
+
+  st_write(node_shp,
+           file.path(cleanOutputs, manuscriptVersion,
+                     paste0(Sys.Date(),"_","arrival_locations_no_anch",".shp")),
+           append = FALSE)
+
+ }
+
+```
+
 
 ```{r ridge plots}
 
@@ -2525,7 +2582,7 @@ if(saveOutputs == TRUE) {
   
 ```
 
-## Fig 5: Seasonal spawning data and maps
+## Fig 6: Seasonal spawning data and maps
 
 Export shapefiles for GIS but still keep the R figure for reference
 
@@ -2549,13 +2606,13 @@ spawningMap <- ggplot() +
                  x = Lon, y = Lat, 
                  size = subsetTWSA),  
              stroke = 0.25) +
-  scale_fill_viridis_c(option = "magma", 
+  scale_fill_viridis_c(option = "plasma", 
                        name = "Percentage of annual incoming sum of TWSA", 
-                       direction = -1,
+                       direction = 1,
                        na.value = "grey80") +
-  scale_color_viridis_c(option = "magma", 
+  scale_color_viridis_c(option = "plasma", 
                        name = "Percentage of annual incoming sum of TWSA", 
-                       direction = -1,
+                       direction = 1,
                        na.value = "grey80") +
   scale_size_continuous(name = expression("Cumulative TWSA arriving at port (m"^2*")"),
                         range = c(2, 10)) +
